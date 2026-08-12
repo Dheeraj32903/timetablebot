@@ -1,23 +1,33 @@
 import asyncio
 import logging
-import os
+import time
+from pathlib import Path
 
 from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 import config
-from erp_session import perform_manual_login, fetch_timetable_html, load_session, _session_path
-from timetable_parser import format_timetable_for_telegram
+from erp.session import perform_login, fetch_timetable_html, load_session, SESSION_PATH
+from parser.timetable import format_timetable_for_telegram
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+# Conversation states for collecting credentials in Telegram chat.
+STATE_WAITING_USERNAME = "waiting_username"
+STATE_WAITING_PASSWORD = "waiting_password"
+
+# Auto-logout session 5 minutes after fetching the timetable.
+SESSION_TIMEOUT_SECONDS = 300
 
 
 def is_authorized(update: Update) -> bool:
@@ -33,13 +43,33 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     await update.message.reply_text(
-        "👋 Hi! I am your private KL University timetable assistant.\n\n"
+        "KL University Timetable Bot\n\n"
         "Commands:\n"
-        "/login — Open the ERP login page so you can complete the CAPTCHA.\n"
-        "/timetable — Fetch and send your latest timetable.\n"
-        "/logout — Clear the saved ERP session.\n"
-        "/status — Check whether an ERP session is saved."
+        "/login — Log in to the ERP\n"
+        "/timetable — Get your timetable\n"
+        "/logout — Log out\n"
+        "/status — Check login status"
     )
+
+
+async def _run_login(update: Update, username: str, password: str) -> None:
+    """Run the async ERP login and report the result."""
+    await update.message.reply_text("Logging in...")
+    start = time.perf_counter()
+    try:
+        await perform_login(username, password)
+        elapsed = time.perf_counter() - start
+        await update.message.reply_text(
+            f"Logged in successfully. ({elapsed:.2f}s)\n"
+            "Send /timetable to get your timetable."
+        )
+    except Exception as exc:
+        elapsed = time.perf_counter() - start
+        logger.exception("Login failed")
+        await update.message.reply_text(
+            f"Login failed. ({elapsed:.2f}s)\n"
+            "Please check your credentials and try again."
+        )
 
 
 async def login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -47,30 +77,45 @@ async def login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("You are not authorized to use this bot.")
         return
 
-    if config.CAPTCHA_SERVICE.lower().strip() == "2captcha" and config.CAPTCHA_API_KEY:
-        await update.message.reply_text(
-            "🌐 Opening the ERP login page in a browser window on this computer.\n"
-            "I will fill your credentials, solve the CAPTCHA automatically, and log in."
-        )
-    else:
-        await update.message.reply_text(
-            "🌐 Opening the ERP login page in a browser window on this computer.\n"
-            "Please complete the CAPTCHA and log in. I will wait up to 5 minutes."
-        )
+    # If credentials are configured in .env, use them directly.
+    if config.ERP_USERNAME and config.ERP_PASSWORD:
+        await _run_login(update, config.ERP_USERNAME, config.ERP_PASSWORD)
+        return
 
-    try:
-        # Playwright is synchronous, so run it in a thread to avoid blocking Telegram updates.
-        loop = asyncio.get_running_loop()
-        session = await loop.run_in_executor(None, perform_manual_login)
-        cookie_count = len(session.get("cookies", []))
-        csrf_status = "CSRF token captured" if session.get("csrf_token") else "CSRF token not found"
-        await update.message.reply_text(
-            f"✅ Login captured. {cookie_count} cookies saved. {csrf_status}.\n"
-            "You can now use /timetable."
-        )
-    except Exception as exc:
-        logger.exception("Login failed")
-        await update.message.reply_text(f"❌ Login failed: {exc}")
+    # Otherwise, start a conversation to collect credentials in Telegram chat.
+    context.user_data["login_state"] = STATE_WAITING_USERNAME
+    await update.message.reply_text("Send your ERP username.")
+
+
+async def handle_login_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle username/password replies during the /login conversation."""
+    if not is_authorized(update):
+        await update.message.reply_text("You are not authorized to use this bot.")
+        return
+
+    state = context.user_data.get("login_state")
+    text = update.message.text.strip()
+
+    if state == STATE_WAITING_USERNAME:
+        context.user_data["erp_username"] = text
+        context.user_data["login_state"] = STATE_WAITING_PASSWORD
+        await update.message.reply_text("Send your ERP password.")
+        return
+
+    if state == STATE_WAITING_PASSWORD:
+        username = context.user_data.pop("erp_username", "")
+        context.user_data.pop("login_state", None)
+        password = text
+
+        if not username:
+            await update.message.reply_text("Something went wrong. Start again with /login.")
+            return
+
+        await _run_login(update, username, password)
+        return
+
+    # If we are not in a login conversation, ignore plain text.
+    await update.message.reply_text("Use /login to log in, or /timetable to get your timetable.")
 
 
 async def timetable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -78,15 +123,33 @@ async def timetable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("You are not authorized to use this bot.")
         return
 
-    await update.message.reply_text("⏳ Fetching your timetable from the ERP...")
+    await update.message.reply_text("Fetching your timetable...")
+    start = time.perf_counter()
 
     try:
-        html = await asyncio.get_running_loop().run_in_executor(None, fetch_timetable_html)
+        html = await fetch_timetable_html()
         message = format_timetable_for_telegram(html)
-        await update.message.reply_text(message, parse_mode="Markdown")
+        elapsed = time.perf_counter() - start
+
+        # Schedule automatic session cleanup after 5 minutes.
+        context.job_queue.run_once(
+            auto_logout_job,
+            when=SESSION_TIMEOUT_SECONDS,
+            chat_id=update.effective_chat.id,
+            name="auto_logout",
+        )
+
+        await update.message.reply_text(
+            f"{message}\n\n_Fetched in {elapsed:.2f}s_",
+            parse_mode="Markdown",
+        )
     except Exception as exc:
+        elapsed = time.perf_counter() - start
         logger.exception("Failed to fetch timetable")
-        await update.message.reply_text(f"❌ Failed to fetch timetable: {exc}")
+        await update.message.reply_text(
+            f"Could not fetch timetable. ({elapsed:.2f}s)\n"
+            "Try logging in again with /login."
+        )
 
 
 async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -94,12 +157,17 @@ async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("You are not authorized to use this bot.")
         return
 
-    path = _session_path()
-    if os.path.exists(path):
-        os.remove(path)
-        await update.message.reply_text("🗑️ Saved ERP session cleared.")
+    if SESSION_PATH.exists():
+        SESSION_PATH.unlink()
+        await update.message.reply_text("Logged out.")
     else:
-        await update.message.reply_text("No saved ERP session to clear.")
+        await update.message.reply_text("You are already logged out.")
+
+
+async def auto_logout_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Background job: clear the ERP session after a timeout."""
+    if SESSION_PATH.exists():
+        SESSION_PATH.unlink()
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -109,13 +177,9 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     session = load_session()
     if session and session.get("cookies"):
-        cookie_names = ", ".join(c.get("name", "?") for c in session["cookies"])
-        await update.message.reply_text(
-            f"💾 Session saved. Cookies: {cookie_names}\n"
-            f"CSRF token: {'yes' if session.get('csrf_token') else 'no'}"
-        )
+        await update.message.reply_text("You are logged in.")
     else:
-        await update.message.reply_text("No saved ERP session. Use /login first.")
+        await update.message.reply_text("You are logged out. Use /login first.")
 
 
 def main() -> None:
@@ -132,6 +196,7 @@ def main() -> None:
     application.add_handler(CommandHandler("timetable", timetable))
     application.add_handler(CommandHandler("logout", logout))
     application.add_handler(CommandHandler("status", status))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_login_message))
 
     logger.info("Bot is starting...")
     application.run_polling()
