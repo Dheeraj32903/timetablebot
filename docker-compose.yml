@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  timetablebot:
+    build: .
+    container_name: klu_timetable_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Persist encrypted credentials and secret key across container rebuilds
+      - ./credentials.json:/app/credentials.json
+      - ./.secret.key:/app/.secret.key
+      - ./.morning_enabled:/app/.morning_enabled

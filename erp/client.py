@@ -160,7 +160,7 @@ async def auto_login(username: str, password: str) -> dict:
     headers = _get_headers()
 
     async with httpx.AsyncClient(
-        verify=False,
+        verify=True,
         headers=headers,
         http2=False,
         follow_redirects=False,
@@ -246,17 +246,11 @@ async def auto_login(username: str, password: str) -> dict:
         response.raise_for_status()
 
         if _is_login_failed(response):
-            debug_path = config.PROJECT_ROOT / "debug_login.html"
-            debug_path.write_text(response.text, encoding="utf-8")
             if "incorrect" in response.text.lower() or "invalid" in response.text.lower():
                 raise RuntimeError(
-                    "ERP rejected the login. Check username, password, or CAPTCHA. "
-                    f"Debug HTML saved to {debug_path}"
+                    "ERP rejected the login. Check username, password, or CAPTCHA."
                 )
-            raise RuntimeError(
-                "ERP login failed (returned login page). "
-                f"Debug HTML saved to {debug_path}"
-            )
+            raise RuntimeError("ERP login failed (returned login page).")
 
         final_csrf = _extract_csrf(response.text) or csrf
 
@@ -289,7 +283,7 @@ async def fetch_timetable(
     )
 
     async with httpx.AsyncClient(
-        verify=False,
+        verify=True,
         headers=headers,
         http2=False,
         follow_redirects=True,

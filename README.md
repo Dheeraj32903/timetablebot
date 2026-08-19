@@ -1,110 +1,184 @@
-# KL University ERP Timetable Telegram Bot
+# KL University ERP Timetable Telegram Bot 🎓
 
-A private Telegram bot that fetches your personal timetable from the KL University ERP (`newerp.kluniversity.in`).
+A fast, secure, and private Telegram bot that fetches and formats your personal timetable directly from the KL University ERP (`newerp.kluniversity.in`).
 
-It logs in automatically using your ERP credentials, solves the CAPTCHA locally with an ONNX model, and sends your current timetable to your Telegram chat.
+Features local automated CAPTCHA solving with ONNX, 256-bit Fernet encrypted multi-user credentials, smart class slot mapping, aesthetic card views with emojis, and daily morning timetable broadcasts.
 
-## How it works
+---
 
-1. You send `/login` from Telegram.
-2. The bot asks for your ERP username and password in chat (or uses the ones in `.env`).
-3. The bot logs in to the ERP in the background, solves the CAPTCHA locally, and saves the session.
-4. You send `/timetable`.
-5. The bot calls the ERP timetable endpoint, parses the HTML table, and sends it to your Telegram chat.
-6. Once Telegram has delivered the message, you can read it offline.
+## ✨ Features
 
-## Security
+- 🔐 **Multi-User Authorization & Security**: Whitelist specific Telegram user IDs. Passwords and usernames are encrypted at rest with Fernet (AES-128-CBC + HMAC-SHA256).
+- 🧩 **Local AI CAPTCHA Solver**: Solves ERP login verification codes locally using an ONNX CRNN model with 0 external API dependencies.
+- 📱 **Aesthetic Card Design**: Clean, card-based mobile layout with slot durations, 12-hour AM/PM timings, room numbers, section pills, and period-type emojis:
+  - 👨‍🏫 **Lecture**
+  - 💻 **Practical Lab & Skill Lab**
+  - 📝 **Tutorial**
+  - 🛠️ **Project**
+- 📚 **Full Course Catalog**: Automatically maps ERP codes to human-readable titles (e.g. `24CC3014-S` ➔ *AWS Certified Solutions Architect (SAA-C03)*, `24AD3107-L` ➔ *Data Science*).
+- 📅 **Day & Week Filtering**: Supports `/timetable today`, `/timetable tomorrow`, `/timetable wed`, and full-week view `/week`.
+- 🌅 **Daily Morning Broadcast**: Automatically delivers your daily schedule every morning at 7:00 AM IST (configurable).
+- 👥 **Friend Timetable**: Check a friend's/classmate's timetable on-demand without overriding your saved credentials (`/friend`).
 
-- The bot only responds to **your** Telegram user ID.
-- Credentials given in Telegram chat are kept in memory only during login and are **not saved to disk**.
-- ERP session cookies are stored locally in `session.json`.
-- CAPTCHA solving happens locally on your machine using the ONNX model in `model/`.
+---
 
-## Requirements
+## 📁 Project Structure
 
-- Python 3.10+
-- Windows / macOS / Linux
-- ONNX model files: `model/crnn.onnx` and `model/crnn.json`
-
-## Project structure
-
-```
+```text
 .
-├── bot.py              # Telegram bot entry point
-├── config.py           # Configuration and project paths
-├── requirements.txt
-├── .env
+├── bot.py                # Telegram bot entry point & command handlers
+├── config.py             # Configuration & environment variable loader
+├── credentials.py        # 256-bit Fernet encryption & secure credentials storage
+├── requirements.txt      # Python package dependencies
+├── .env.example          # Environment variables template
 ├── erp/
-│   ├── client.py       # HTTP client for ERP login + timetable
-│   ├── session.py      # Session cookie persistence
-│   └── captcha_solver.py  # Local ONNX CAPTCHA solver
+│   ├── client.py         # Asynchronous HTTP client for ERP login & timetable fetch
+│   ├── session.py        # ERP session & cookie management
+│   └── captcha_solver.py # Local ONNX CRNN CAPTCHA solver
 ├── parser/
-│   └── timetable.py    # ERP timetable HTML parser
+│   └── timetable.py      # Timetable HTML parser, course catalog & card formatter
 └── model/
-    ├── crnn.onnx
-    └── crnn.json
+    ├── crnn.onnx         # Pre-trained CAPTCHA recognition model
+    └── crnn.json         # Character dictionary
 ```
 
-## Setup
+---
 
-1. Clone or copy this project to your machine.
-2. Make sure the `model/` folder contains `crnn.onnx` and `crnn.json`.
-3. Create a virtual environment and install dependencies:
+## 🚀 Setup & Local Running
+
+### 1. Prerequisites
+- Python 3.10 or higher
+- Telegram Bot Token from [@BotFather](https://t.me/BotFather)
+- Your Telegram User ID from [@userinfobot](https://t.me/userinfobot)
+
+### 2. Installation
 
 ```bash
+# 1. Clone repository
+git clone https://github.com/Dheeraj32903/timetablebot.git
+cd timetablebot
+
+# 2. Create virtual environment
 python -m venv .venv
-.venv\Scripts\activate        # Windows
-# source .venv/bin/activate   # macOS/Linux
+source .venv/bin/activate    # Linux / macOS
+# .venv\Scripts\activate     # Windows
+
+# 3. Install dependencies
 pip install -r requirements.txt
 ```
 
-4. Copy the environment template and fill it in:
+### 3. Configuration
 
+Copy the example configuration file:
 ```bash
-copy .env.example .env       # Windows
-# cp .env.example .env       # macOS/Linux
+cp .env.example .env    # Linux / macOS
+# copy .env.example .env # Windows
 ```
 
-5. Edit `.env`:
-
+Edit `.env` with your values:
 ```env
-TELEGRAM_BOT_TOKEN=your_bot_token_from_BotFather
-AUTHORIZED_TELEGRAM_USER_ID=your_telegram_user_id
+TELEGRAM_BOT_TOKEN=1234567890:ABCdefGHIjklMNOpqrSTUvwxYZ
+AUTHORIZED_TELEGRAM_USER_IDS=6986045748,7337604045
+
+# Optional: Set a specific 32-byte Fernet key (if left blank, one is auto-generated)
+CREDENTIALS_ENCRYPTION_KEY=
+
+# Morning broadcast time (IST 24-hour format)
+MORNING_TIMETABLE_HOUR=7
+MORNING_TIMETABLE_MINUTE=0
 ```
 
-- Get your bot token from [@BotFather](https://t.me/BotFather).
-- Get your Telegram user ID from [@userinfobot](https://t.me/userinfobot).
-- `ERP_TIMETABLE_URL` already contains the real KL University timetable route. If your academic year or semester changes, update the `academicyear` and `semesterid` values in that URL.
-- Optional: set `ERP_USERNAME` and `ERP_PASSWORD` in `.env` to skip typing them in Telegram chat.
-
-6. Run the bot:
+### 4. Run the Bot
 
 ```bash
 python bot.py
 ```
 
-7. In Telegram, send `/login` to your bot, then follow the prompts. If credentials are in `.env`, `/login` will log in immediately.
+---
 
-## Commands
+## 🤖 Bot Commands
 
 | Command | Description |
-|---------|-------------|
-| `/start` | Show help. |
-| `/login` | Log in to the ERP automatically (asks for credentials in chat if not in `.env`). |
-| `/timetable` | Fetch and send the latest timetable. |
-| `/status` | Check whether an ERP session is saved. |
-| `/logout` | Clear the saved session. |
+| :--- | :--- |
+| `/start` | Welcome message & command list |
+| `/login` | Interactive ERP login (saves encrypted credentials for auto-login) |
+| `/timetable` | View today's timetable |
+| `/timetable <day>` | View timetable for a specific day (`today`, `tomorrow`, `mon`, `tue`, etc.) |
+| `/week` | View the full week's schedule |
+| `/friend` | Fetch another student's timetable without overriding your saved account |
+| `/morning` | Toggle automated daily 7:00 AM IST morning timetable delivery |
+| `/status` | Check current active login session status |
+| `/logout` | Log out and wipe saved credentials from disk |
 
-## Troubleshooting
+---
 
-- **"No active ERP session"** — run `/login` again.
-- **"ERP session expired"** — the ERP logged you out. Run `/login` again.
-- **"CAPTCHA solver returned empty text"** — make sure `model/crnn.onnx` and `model/crnn.json` exist.
-- **"ERP login failed"** — check your username and password.
-- **Timetable table looks wrong** — the HTML parser uses the largest table in the page. If the ERP layout changes, update `parser/timetable.py`.
+## 🌐 Production Deployment (Linux / AWS / VPS)
 
-## Notes
+### Option A: Running with Docker (Easiest & Cleanest)
 
-- This bot is designed for a single authorized user only.
-- The ERP is always the source of truth: every `/timetable` request fetches the current timetable from the ERP in real time.
-- No browser window is needed; everything is done through HTTP requests.
+1. Make sure Docker and Docker Compose are installed on your server.
+2. Clone the repo and configure your `.env`:
+   ```bash
+   cp .env.example .env
+   nano .env
+   ```
+3. Start the bot in the background:
+   ```bash
+   docker compose up -d --build
+   ```
+4. Check live logs:
+   ```bash
+   docker compose logs -f
+   ```
+5. Stop the bot:
+   ```bash
+   docker compose down
+   ```
+
+---
+
+### Option B: Running with `systemd` (Without Docker)
+
+1. Create a service file:
+```bash
+sudo nano /etc/systemd/system/timetablebot.service
+```
+
+2. Paste the following configuration (adjust paths and user):
+```ini
+[Unit]
+Description=KL University Timetable Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/timetablebot
+ExecStart=/home/ubuntu/timetablebot/.venv/bin/python bot.py
+Restart=always
+RestartSec=10
+EnvironmentFile=/home/ubuntu/timetablebot/.env
+
+[Install]
+WantedBy=multi-user.target
+```
+
+3. Enable and start the service:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable timetablebot
+sudo systemctl start timetablebot
+```
+
+4. Check logs:
+```bash
+sudo journalctl -u timetablebot -f
+```
+
+---
+
+## 🔒 Security & Privacy
+
+- **Encrypted at Rest**: User ERP passwords and student registration IDs in `credentials.json` are encrypted using authenticated 256-bit Fernet AES-128-CBC + HMAC-SHA256.
+- **Whitelist Protected**: Only authorized Telegram user IDs listed in `AUTHORIZED_TELEGRAM_USER_IDS` can interact with the bot.
+- **Local CAPTCHA Processing**: CAPTCHA images are decoded strictly in-memory using the local ONNX runtime model. No images or tokens are sent to third-party APIs.

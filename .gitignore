@@ -7,5 +7,12 @@ venv/
 env/
 .session/
 session.json
+.timetable_hash
+.secret.key
+credentials.json
+.morning_enabled
+.chat_id
+debug_login.html
+*.html
 *.log
 .DS_Store

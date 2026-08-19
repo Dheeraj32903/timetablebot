@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: klu-timetable-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: AUTHORIZED_TELEGRAM_USER_IDS
+        sync: false
+      - key: CREDENTIALS_ENCRYPTION_KEY
+        sync: false
+      - key: MORNING_TIMETABLE_HOUR
+        value: "7"
+      - key: MORNING_TIMETABLE_MINUTE
+        value: "0"
