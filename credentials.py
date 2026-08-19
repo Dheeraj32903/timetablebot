@@ -92,12 +92,27 @@ def _decrypt_val(value: str) -> str:
 
 
 def _load_credentials() -> dict:
-    if not config.CREDENTIALS_FILE.exists():
-        return {}
-    try:
-        return json.loads(config.CREDENTIALS_FILE.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return {}
+    """Load credentials from file, environment variable, or fallback config."""
+    import os
+
+    # 1. Check persistent file on disk / injected Render secret file
+    if config.CREDENTIALS_FILE.exists():
+        try:
+            data = json.loads(config.CREDENTIALS_FILE.read_text(encoding="utf-8"))
+            if data:
+                return data
+        except json.JSONDecodeError:
+            pass
+
+    # 2. Check environment variable STORED_CREDENTIALS_JSON (Render persistent config)
+    env_creds_raw = os.getenv("STORED_CREDENTIALS_JSON", "").strip()
+    if env_creds_raw:
+        try:
+            return json.loads(env_creds_raw)
+        except json.JSONDecodeError:
+            pass
+
+    return {}
 
 
 def _save_credentials(creds: dict) -> None:
@@ -121,12 +136,20 @@ def save_user_credentials(telegram_user_id: int, username: str, password: str) -
 def load_user_credentials(telegram_user_id: int) -> Optional[dict]:
     """Load and decrypt stored ERP credentials for a Telegram user, if any."""
     record = _load_credentials().get(str(telegram_user_id))
-    if not record:
-        return None
-    return {
-        "username": _decrypt_val(record["username"]),
-        "password": _decrypt_val(record["password"]),
-    }
+    if record:
+        return {
+            "username": _decrypt_val(record["username"]),
+            "password": _decrypt_val(record["password"]),
+        }
+
+    # Fallback to ERP_USERNAME and ERP_PASSWORD from .env if configured
+    if config.ERP_USERNAME and config.ERP_PASSWORD:
+        return {
+            "username": config.ERP_USERNAME,
+            "password": config.ERP_PASSWORD,
+        }
+
+    return None
 
 
 def delete_user_credentials(telegram_user_id: int) -> None:
