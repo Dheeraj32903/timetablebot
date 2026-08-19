@@ -34,6 +34,8 @@ logger = logging.getLogger(__name__)
 STATE_WAITING_USERNAME = "waiting_username"
 STATE_WAITING_PASSWORD = "waiting_password"
 
+BOT_VERSION = "4.2.0"
+
 # Auto-logout session 5 minutes after fetching the timetable.
 SESSION_TIMEOUT_SECONDS = 300
 
@@ -515,7 +517,7 @@ def main() -> None:
     # Schedule the daily morning timetable job for all users with stored credentials.
     _schedule_morning_timetable_job(application)
 
-    logger.info("Bot is starting...")
+    logger.info("KL University Timetable Bot v%s is starting...", BOT_VERSION)
     application.run_polling()
 
 
