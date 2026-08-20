@@ -503,7 +503,28 @@ def auto_migrate_local_data() -> None:
             except Exception as exc:
                 logger.warning("Auto-migration of %s failed: %s", cred_file, exc)
 
-    # 3. Migrate global morning setting if set
+    # 3. Migrate from STORED_CREDENTIALS_JSON env var
+    import os
+    env_creds_raw = os.getenv("STORED_CREDENTIALS_JSON", "").strip()
+    if env_creds_raw:
+        try:
+            data = json.loads(env_creds_raw)
+            for user_id_str, rec in data.items():
+                if rec.get("username") and rec.get("password"):
+                    uid = int(user_id_str)
+                    if is_mongodb_active():
+                        doc = _mongo_db.users.find_one({"_id": uid})
+                        if not doc or not doc.get("username"):
+                            save_user_credentials(uid, rec["username"], rec["password"])
+                            logger.info("Migrated user %d from STORED_CREDENTIALS_JSON into MongoDB Atlas.", uid)
+                    else:
+                        existing = load_user_credentials(uid)
+                        if not existing:
+                            save_user_credentials(uid, rec["username"], rec["password"])
+        except Exception as exc:
+            logger.warning("Auto-migration of STORED_CREDENTIALS_JSON failed: %s", exc)
+
+    # 4. Migrate global morning setting if set
     if config.MORNING_ENABLED_FILE.exists():
         try:
             if config.MORNING_ENABLED_FILE.read_text(encoding="utf-8").strip() == "1":
