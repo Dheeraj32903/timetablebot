@@ -8,6 +8,7 @@ Features local automated CAPTCHA solving with ONNX, 256-bit Fernet encrypted mul
 
 ## ✨ Features
 
+- 🔘 **Interactive Telegram UI & Menus**: Full support for persistent reply keyboards, interactive inline buttons, day selector grids, in-place day navigation (`[◀️ Prev]`, `[Next ▶️]`, `[🔄 Refresh]`), and native Telegram `/` popup command menus.
 - 🔐 **Multi-User Authorization & Security**: Whitelist specific Telegram user IDs. Passwords and usernames are encrypted at rest with Fernet (AES-128-CBC + HMAC-SHA256).
 - 🧩 **Local AI CAPTCHA Solver**: Solves ERP login verification codes locally using an ONNX CRNN model with 0 external API dependencies.
 - 📱 **Aesthetic Card Design**: Clean, card-based mobile layout with slot durations, 12-hour AM/PM timings, room numbers, section pills, and period-type emojis:
@@ -16,7 +17,7 @@ Features local automated CAPTCHA solving with ONNX, 256-bit Fernet encrypted mul
   - 📝 **Tutorial**
   - 🛠️ **Project**
 - 📚 **Full Course Catalog**: Automatically maps ERP codes to human-readable titles (e.g. `24CC3014-S` ➔ *AWS Certified Solutions Architect (SAA-C03)*, `24AD3107-L` ➔ *Data Science*).
-- 📅 **Day & Week Filtering**: Supports `/timetable today`, `/timetable tomorrow`, `/timetable wed`, and full-week view `/week`.
+- 📅 **Day & Week Filtering**: Supports `/timetable today`, `/timetable tomorrow`, `/timetable wed`, and full-week view `/week` with one-tap inline buttons.
 - 🌅 **Daily Morning Broadcast**: Automatically delivers your daily schedule every morning at 7:00 AM IST (configurable).
 - 👥 **Friend Timetable**: Check a friend's/classmate's timetable on-demand without overriding your saved credentials (`/friend`).
 
@@ -80,7 +81,12 @@ Edit `.env` with your values:
 TELEGRAM_BOT_TOKEN=1234567890:ABCdefGHIjklMNOpqrSTUvwxYZ
 AUTHORIZED_TELEGRAM_USER_IDS=6986045748,7337604045
 
-# Optional: Set a specific 32-byte Fernet key (if left blank, one is auto-generated)
+# MongoDB Atlas Cloud Database (ensures user logins persist across all redeployments)
+# Get your free connection string from https://cloud.mongodb.com
+MONGODB_URI=mongodb+srv://<username>:<password>@timetablebot.abcde.mongodb.net/?retryWrites=true&w=majority
+MONGODB_DB_NAME=klu_timetable_bot
+
+# Optional: Set a specific 32-byte Fernet key (if left blank, a stable key is auto-derived)
 CREDENTIALS_ENCRYPTION_KEY=
 
 # Morning broadcast time (IST 24-hour format)

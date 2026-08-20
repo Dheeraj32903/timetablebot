@@ -8,3 +8,8 @@ onnxruntime>=1.17.0
 Pillow>=10.2.0
 numpy>=1.26.0
 cryptography>=42.0.0
+pymongo>=4.6.0
+dnspython>=2.6.0
+certifi>=2024.2.2
+
+

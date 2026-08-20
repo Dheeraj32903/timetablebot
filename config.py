@@ -1,17 +1,32 @@
-# Project paths
-from pathlib import Path
-
-PROJECT_ROOT = Path(__file__).parent.resolve()
-MODEL_DIR = PROJECT_ROOT / "model"
-SESSION_FILE = PROJECT_ROOT / "session.json"
-CREDENTIALS_FILE = PROJECT_ROOT / "credentials.json"
-MORNING_ENABLED_FILE = PROJECT_ROOT / ".morning_enabled"
-
-# Telegram
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
+
+PROJECT_ROOT = Path(__file__).parent.resolve()
+MODEL_DIR = PROJECT_ROOT / "model"
+
+# Data directory for persistent files if running locally or with attached volume
+_env_data_dir = os.getenv("DATA_DIR", "").strip()
+if _env_data_dir:
+    DATA_DIR = Path(_env_data_dir).resolve()
+elif Path("/data").exists() and os.access("/data", os.W_OK):
+    DATA_DIR = Path("/data")
+else:
+    DATA_DIR = PROJECT_ROOT
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+SESSION_FILE = DATA_DIR / "session.json"
+CREDENTIALS_FILE = DATA_DIR / "credentials.json"
+MORNING_ENABLED_FILE = DATA_DIR / ".morning_enabled"
+SECRET_KEY_FILE = DATA_DIR / ".secret.key"
+
+# MongoDB Database Configuration
+MONGODB_URI = os.getenv("MONGODB_URI", "").strip()
+MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "klu_timetable_bot").strip()
+
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 

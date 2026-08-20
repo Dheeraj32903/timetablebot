@@ -15,4 +15,8 @@ credentials.json
 debug_login.html
 *.html
 *.log
+*.db
+timetablebot.db
+data/
 .DS_Store
+
