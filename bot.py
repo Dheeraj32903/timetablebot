@@ -23,6 +23,7 @@ from erp.session import perform_login, fetch_timetable_html, load_session
 from erp.client import auto_login
 from parser.timetable import (
     format_timetable_for_telegram,
+    get_timetable_messages,
     _today_day_name,
     resolve_day_name,
 )
@@ -241,11 +242,17 @@ async def timetable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             else:
                 raise
 
-        message = format_timetable_for_telegram(html, day=day)
+        messages = get_timetable_messages(html, day_filter=day)
+        if not messages:
+            await status_msg.edit_text("⚠️ <i>Could not extract timetable.</i>", parse_mode="HTML")
+            return
+
         await status_msg.edit_text(
-            message,
+            messages[0],
             parse_mode="HTML",
         )
+        for extra_msg in messages[1:]:
+            await update.message.reply_text(extra_msg, parse_mode="HTML")
     except Exception as exc:
         logger.exception("Failed to fetch timetable")
         await status_msg.edit_text(
@@ -275,13 +282,19 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             else:
                 raise
 
-        message = format_timetable_for_telegram(html)
+        messages = get_timetable_messages(html)
+        if not messages:
+            await status_msg.edit_text("⚠️ <i>Could not extract timetable.</i>", parse_mode="HTML")
+            return
+
         await status_msg.edit_text(
-            message,
+            messages[0],
             parse_mode="HTML",
         )
+        for extra_msg in messages[1:]:
+            await update.message.reply_text(extra_msg, parse_mode="HTML")
     except Exception as exc:
-        logger.exception("Failed to fetch timetable")
+        logger.exception("Failed to fetch week timetable")
         await status_msg.edit_text(
             "❌ Could not fetch timetable.\n"
             "Try logging in again with /login."

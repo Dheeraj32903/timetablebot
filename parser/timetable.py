@@ -130,7 +130,15 @@ _DAY_FULL_NAMES = {
 
 def _normalize_day_name(day: str) -> str:
     """Normalize a day name to a short title-case form, e.g. 'monday' -> 'Mon'."""
-    return _DAY_MAP.get(day.strip().lower(), day.strip())
+    if not day:
+        return ""
+    d = day.strip().lower()
+    if d in _DAY_MAP:
+        return _DAY_MAP[d]
+    m = re.search(r"\b(mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)\b", d, re.IGNORECASE)
+    if m:
+        return _DAY_MAP.get(m.group(1).lower(), day.strip())
+    return day.strip()
 
 
 def _ist_now() -> datetime:
@@ -230,6 +238,8 @@ def _parse_table_to_grid(table: Tag) -> List[List[str]]:
 
 
 def _is_day_name(text: str) -> bool:
+    if not text:
+        return False
     return _normalize_day_name(text).lower() in {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
 
 
@@ -249,7 +259,14 @@ def _find_header_and_data_rows(grid: List[List[str]]) -> tuple:
             header_idx = max(0, i - 1)
             break
 
-    return header_idx, list(range(data_start, len(grid)))
+    data_indices = [
+        i for i in range(data_start, len(grid))
+        if grid[i] and _is_day_name(grid[i][0])
+    ]
+    if not data_indices:
+        data_indices = list(range(data_start, len(grid)))
+
+    return header_idx, data_indices
 
 
 def _drop_empty_columns(grid: List[List[str]], data_indices: List[int]) -> List[List[str]]:
@@ -384,10 +401,9 @@ def _format_day(day: str, periods: List[str], header: List[str]) -> str:
     )
 
 
-def parse_timetable_html(html: str, day_filter: Optional[str] = None) -> str:
+def parse_timetable_sections(html: str, day_filter: Optional[str] = None) -> List[Tuple[str, str]]:
     """
-    Parse the ERP timetable HTML and return an aesthetically formatted string.
-
+    Parse the ERP timetable HTML and return a list of (day_name, formatted_day_schedule) tuples.
     If ``day_filter`` is provided, only the matching day is returned.
     """
     soup = BeautifulSoup(html, "lxml")
@@ -398,12 +414,12 @@ def parse_timetable_html(html: str, day_filter: Optional[str] = None) -> str:
 
     tables = soup.find_all("table")
     if not tables:
-        return "⚠️ <i>No timetable table found in the ERP response.</i>"
+        return []
 
     best_table = max(tables, key=lambda t: len(t.find_all(["td", "th"])))
     grid = _parse_table_to_grid(best_table)
     if not grid:
-        return "⚠️ <i>Timetable table is empty.</i>"
+        return []
 
     header_idx, data_indices = _find_header_and_data_rows(grid)
     header = grid[header_idx] if header_idx < len(grid) else []
@@ -414,35 +430,90 @@ def parse_timetable_html(html: str, day_filter: Optional[str] = None) -> str:
 
     normalized_filter = _normalize_day_name(day_filter) if day_filter else None
 
-    sections = []
+    sections: List[Tuple[str, str]] = []
     for r in data_indices:
         row = grid[r]
         if not row:
             continue
-        day = _normalize_day_name(row[0]) if row[0] else f"Row {r}"
+        first_cell = row[0] if len(row) > 0 else ""
+        if not _is_day_name(first_cell):
+            continue
+        day = _normalize_day_name(first_cell)
         if normalized_filter and day != normalized_filter:
             continue
         periods = row[1:]
-        sections.append(_format_day(day, periods, header[1:] if len(header) > 1 else []))
+        sections.append((day, _format_day(day, periods, header[1:] if len(header) > 1 else [])))
+
+    return sections
+
+
+def parse_timetable_html(html: str, day_filter: Optional[str] = None) -> str:
+    """
+    Parse the ERP timetable HTML and return an aesthetically formatted string.
+
+    If ``day_filter`` is provided, only the matching day is returned.
+    """
+    sections = parse_timetable_sections(html, day_filter=day_filter)
 
     if not sections:
         if day_filter:
+            normalized_filter = _normalize_day_name(day_filter)
             full_name = _DAY_FULL_NAMES.get(normalized_filter, day_filter).upper()
             return (
                 f"📅 <b>{full_name} SCHEDULE</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"🏖️ <i>No classes scheduled! Free day.</i>"
             )
-        return "⚠️ <i>Could not extract timetable rows.</i>"
+        return "⚠️ <i>Could not extract timetable rows from ERP response.</i>"
 
     # Separate days with a clean divider in week view
-    return "\n\n━━━━━━━━━━━━━━━━━━━━━━\n\n".join(sections)
+    return "\n\n━━━━━━━━━━━━━━━━━━━━━━\n\n".join(text for _, text in sections)
+
+
+def get_timetable_messages(html: str, day_filter: Optional[str] = None, max_length: int = 3800) -> List[str]:
+    """
+    Parse timetable and partition formatted days into chunks <= max_length characters
+    to prevent exceeding Telegram message limits (4096) or breaking HTML formatting.
+    """
+    sections = parse_timetable_sections(html, day_filter=day_filter)
+
+    if not sections:
+        if day_filter:
+            normalized_filter = _normalize_day_name(day_filter)
+            full_name = _DAY_FULL_NAMES.get(normalized_filter, day_filter).upper()
+            return [(
+                f"📅 <b>{full_name} SCHEDULE</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🏖️ <i>No classes scheduled! Free day.</i>"
+            )]
+        return ["⚠️ <i>Could not extract timetable schedule from ERP response.</i>"]
+
+    messages: List[str] = []
+    current_chunk: List[str] = []
+    current_len = 0
+    divider = "\n\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    divider_len = len(divider)
+
+    for _, day_text in sections:
+        day_len = len(day_text)
+        if not current_chunk:
+            current_chunk.append(day_text)
+            current_len = day_len
+        elif current_len + divider_len + day_len <= max_length:
+            current_chunk.append(day_text)
+            current_len += divider_len + day_len
+        else:
+            messages.append(divider.join(current_chunk))
+            current_chunk = [day_text]
+            current_len = day_len
+
+    if current_chunk:
+        messages.append(divider.join(current_chunk))
+
+    return messages
 
 
 def format_timetable_for_telegram(html: str, day: Optional[str] = None) -> str:
-    """Format the timetable HTML for Telegram display."""
-    text = parse_timetable_html(html, day_filter=day)
-    # Telegram message limit is 4096 characters.
-    if len(text) > 3900:
-        text = text[:3897] + "..."
-    return text
+    """Format the timetable HTML for Telegram display without breaking HTML tags."""
+    messages = get_timetable_messages(html, day_filter=day)
+    return messages[0] if messages else "⚠️ <i>Timetable is empty.</i>"
