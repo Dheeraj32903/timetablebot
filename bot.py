@@ -142,7 +142,6 @@ async def _run_login(update: Update, username: str, password: str) -> None:
 
         await update.message.reply_text(
             "✅ <b>Logged in successfully.</b>\n"
-            "Your credentials are saved securely. You won't need to log in again.\n"
             "Send /timetable to get your timetable.",
             parse_mode="HTML"
         )
