@@ -11,8 +11,10 @@ from telegram import (
     BotCommandScopeDefault,
     Update,
 )
+from telegram.constants import ChatMemberStatus
 from telegram.ext import (
     Application,
+    ChatMemberHandler,
     CommandHandler,
     ContextTypes,
     Defaults,
@@ -72,16 +74,15 @@ def is_authorized(update: Update) -> bool:
 
 
 BOT_COMMANDS = [
-    BotCommand("start", "View all available commands"),
     BotCommand("timetable", "Today's classes, timings & rooms"),
     BotCommand("week", "Full weekly timetable view"),
     BotCommand("friend", "Check your friend's timetable"),
     BotCommand("login", "Connect & save ERP credentials"),
-    BotCommand("morning", "Toggle daily 7 AM morning alert"),
+    BotCommand("morning", "Sends the day's schedule daily at 7 AM"),
     BotCommand("status", "Check ERP connection status"),
+    BotCommand("description", "Why use this bot & key benefits"),
     BotCommand("privacy", "View bot privacy policy"),
-    BotCommand("delete_me", "Permanently delete your stored data"),
-    BotCommand("logout", "Clear your saved credentials"),
+    BotCommand("logout", "Log out & clear your data"),
 ]
 
 
@@ -109,10 +110,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception:
             pass
 
+    welcome_text = (
+        "🎓 <b>Your Timetable Assistant welcomes you!</b>\n\n"
+        "Your classes, schedule &amp; rooms — all in one place.\n\n"
+        "✨ <b>What you can do:</b>\n\n"
+        "📅 Check today's classes &amp; room numbers\n\n"
+        "🗓️ View your full weekly timetable\n\n"
+        "⏰ Get daily morning schedule alerts\n\n"
+        "👥 Check your friends' schedules\n\n"
+        "👇 Tap the Menu button below ( or ) Type  /  to view commands"
+    )
+
     if update.message:
         await update.message.reply_text(
-            "👋 <b>Welcome!</b>\n"
-            "Use the <b>Menu</b> button below or type <code>/</code> to view all commands.",
+            welcome_text,
             parse_mode="HTML",
         )
 
@@ -350,11 +361,23 @@ async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     user = update.effective_user
-    if user:
-        credentials.delete_user_credentials(user.id)
-        storage.delete_user_session(user.id)
+    uid = user.id if user else None
+    if uid:
+        try:
+            storage.delete_user_all_data(uid)
+            context.user_data.clear()
+            if not storage.get_all_morning_users() and context.job_queue:
+                for job in context.job_queue.get_jobs_by_name(MORNING_TIMETABLE_JOB_NAME):
+                    job.schedule_removal()
+        except Exception as exc:
+            logger.error("Error during logout for %s: %s", uid, exc)
 
-    await update.message.reply_text("🚪 Logged out and removed your saved credentials from the database.")
+    await update.message.reply_text(
+        "🚪 <b>Logged out successfully.</b>\n"
+        "Your saved credentials, session cookies, and preferences have been cleared from the database.\n"
+        "Use /login whenever you want to reconnect.",
+        parse_mode="HTML",
+    )
 
 
 async def _send_morning_timetable(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -455,14 +478,21 @@ async def morning(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             if context.job_queue:
                 for job in context.job_queue.get_jobs_by_name(MORNING_TIMETABLE_JOB_NAME):
                     job.schedule_removal()
-        await update.message.reply_text("🔕 Morning timetable message disabled.")
+        await update.message.reply_text(
+            "🔕 <b>Daily morning alert disabled.</b>\n"
+            "You will not receive automatic morning schedules.\n\n"
+            "<i>To enable it again, send /morning</i>",
+            parse_mode="HTML",
+        )
     else:
         _set_morning_enabled(True, user.id)
         _schedule_morning_timetable_job(context)
         await update.message.reply_text(
-            f"🔔 Morning timetable message enabled. You will receive it daily at "
-            f"<b>{config.MORNING_TIMETABLE_HOUR:02d}:{config.MORNING_TIMETABLE_MINUTE:02d} IST</b>.",
-            parse_mode="HTML"
+            f"🔔 <b>Daily morning alert enabled!</b>\n"
+            f"The bot will automatically send your day's schedule every morning at "
+            f"<b>{config.MORNING_TIMETABLE_HOUR:02d}:{config.MORNING_TIMETABLE_MINUTE:02d} IST</b>.\n\n"
+            f"<i>To disable it anytime, send /morning</i>",
+            parse_mode="HTML",
         )
 
 
@@ -502,66 +532,48 @@ async def privacy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• <b>Render:</b> The bot application runs as a secure cloud service on Render.\n"
         "• <b>Telegram:</b> Messages and commands are transmitted via the official Telegram Bot API.\n\n"
         "<b>4. Your Control & Data Deletion</b>\n"
-        "• <b>/logout:</b> Clears your saved ERP credentials and session cookies.\n"
-        "• <b>/delete_me:</b> Permanently wipes your entire record and all data from our database."
+        "• <b>/logout:</b> Clears your saved ERP credentials, active sessions, and data from the database."
     )
 
     await update.message.reply_text(privacy_text, parse_mode="HTML")
 
 
-async def delete_me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Allow the user to permanently delete all their stored data from MongoDB."""
+async def description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send project description and key benefits of using the bot."""
     if not is_authorized(update):
         await update.message.reply_text("⛔ You are not authorized to use this bot.")
         return
 
-    user = update.effective_user
+    desc_text = (
+        "💡 <b>Why use this bot?</b>\n\n"
+        "• 📅 <b>Direct ERP Sync:</b>\n"
+        "Get your latest timetable directly from the ERP.\n\n"
+        "• ⚡ <b>Offline Access:</b>\n"
+        "In case of an emergency or when you don't have internet, you can simply open the timetable message already received in Telegram instead of going back to the ERP and logging in again.\n\n"
+        "• 🔄 <b>Live Updates:</b>\n"
+        "If you know there is a change in timetable, simply send the <code>/timetable</code> command again."
+    )
+
+    await update.message.reply_text(desc_text, parse_mode="HTML")
+
+
+async def handle_user_status_change(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Automatically purge user data from MongoDB when the user stops, blocks, or deletes their chat with the bot."""
+    if not update.my_chat_member:
+        return
+
+    new_status = update.my_chat_member.new_chat_member.status
+    user = update.my_chat_member.from_user
     uid = user.id if user else None
-    if not uid:
-        return
 
-    arg = " ".join(context.args).strip().lower() if context.args else ""
-    if arg != "confirm":
-        await update.message.reply_text(
-            "⚠️ <b>Delete All Stored Data</b>\n\n"
-            "This will permanently delete:\n"
-            "• Your encrypted ERP credentials\n"
-            "• Your active session cookies\n"
-            "• Your morning alert settings\n"
-            "• Your entire user profile from the database\n\n"
-            "To confirm permanent deletion, send:\n"
-            "<code>/delete_me confirm</code>",
-            parse_mode="HTML",
-        )
-        return
-
-    try:
-        deleted = storage.delete_user_all_data(uid)
-        context.user_data.clear()
-
-        # Check if morning job needs removal if no users left
-        if not storage.get_all_morning_users() and context.job_queue:
-            for job in context.job_queue.get_jobs_by_name(MORNING_TIMETABLE_JOB_NAME):
-                job.schedule_removal()
-
-        if deleted:
-            await update.message.reply_text(
-                "🗑️ <b>Your stored data has been permanently deleted.</b>\n"
-                "All your credentials, session cookies, and preferences were removed from the database.\n"
-                "You can start fresh anytime with /login.",
-                parse_mode="HTML",
-            )
-        else:
-            await update.message.reply_text(
-                "ℹ️ No stored data was found for your account in the database.",
-                parse_mode="HTML",
-            )
-    except Exception as exc:
-        logger.exception("Failed to delete user data for uid=%s", uid)
-        await update.message.reply_text(
-            "❌ Could not delete data due to a server error. Please try again later.",
-            parse_mode="HTML",
-        )
+    # Triggered when user blocks or deletes chat with the bot
+    if new_status in (ChatMemberStatus.BANNED, ChatMemberStatus.LEFT, ChatMemberStatus.KICKED):
+        if uid:
+            try:
+                storage.delete_user_all_data(uid)
+                logger.info("User %s deleted chat/blocked the bot. Automatically purged stored data from MongoDB.", uid)
+            except Exception as exc:
+                logger.error("Failed to auto-delete user data on chat deletion for uid=%s: %s", uid, exc)
 
 
 async def _start_health_server(app: Application) -> None:
@@ -633,16 +645,18 @@ def main() -> None:
     application.add_handler(CommandHandler("friend", friend))
     application.add_handler(CommandHandler("morning", morning))
     application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("description", description))
+    application.add_handler(CommandHandler("describe", description))
     application.add_handler(CommandHandler("privacy", privacy))
-    application.add_handler(CommandHandler("delete_me", delete_me))
     application.add_handler(CommandHandler("logout", logout))
+    application.add_handler(ChatMemberHandler(handle_user_status_change, ChatMemberHandler.MY_CHAT_MEMBER))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_login_message))
 
     # Schedule the daily morning timetable job for all users with stored credentials.
     _schedule_morning_timetable_job(application)
 
     logger.info("KL University Timetable Bot v%s is starting...", BOT_VERSION)
-    application.run_polling()
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
