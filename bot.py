@@ -373,8 +373,7 @@ async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.message.reply_text(
         "🚪 <b>Logged out successfully.</b>\n"
-        "Your saved credentials, session cookies, and preferences have been cleared from the database.\n"
-        "Use /login whenever you want to reconnect.",
+        "Use /login to log in again.",
         parse_mode="HTML",
     )
 
