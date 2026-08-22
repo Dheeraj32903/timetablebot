@@ -5,7 +5,12 @@ from datetime import datetime, time as dt_time
 from pathlib import Path
 from typing import Optional, Tuple
 
-from telegram import Update
+from telegram import (
+    BotCommand,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
+    Update,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -66,25 +71,50 @@ def is_authorized(update: Update) -> bool:
     return user.id in config.AUTHORIZED_TELEGRAM_USER_IDS
 
 
+BOT_COMMANDS = [
+    BotCommand("start", "View all available commands"),
+    BotCommand("timetable", "Today's classes, timings & rooms"),
+    BotCommand("week", "Full weekly timetable view"),
+    BotCommand("friend", "Check your friend's timetable"),
+    BotCommand("login", "Connect & save ERP credentials"),
+    BotCommand("morning", "Toggle daily 7 AM morning alert"),
+    BotCommand("status", "Check ERP connection status"),
+    BotCommand("privacy", "View bot privacy policy"),
+    BotCommand("delete_me", "Permanently delete your stored data"),
+    BotCommand("logout", "Clear your saved credentials"),
+]
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    uid = user.id if user else None
+
     if not is_authorized(update):
+        if uid:
+            try:
+                await context.bot.delete_my_commands(scope=BotCommandScopeChat(chat_id=uid))
+            except Exception:
+                pass
         if update.message:
-            await update.message.reply_text("⛔ You are not authorized to use this bot.")
+            await update.message.reply_text(
+                "⛔ <b>Access Denied.</b>\nYou are not authorized to use this bot.",
+                parse_mode="HTML",
+            )
         return
 
-    await update.message.reply_text(
-        "🎓 <b>KL University Timetable Bot</b>\n\n"
-        "<b>Available Commands:</b>\n"
-        "/login — Log in and save your ERP credentials\n"
-        "/timetable — Get today's timetable\n"
-        "/timetable &lt;day&gt; — Get timetable for a day (today/yesterday/tomorrow/mon/...)\n"
-        "/week — Get full week timetable\n"
-        "/friend — Get another user's timetable without saving credentials\n"
-        "/morning — Toggle daily morning timetable alert\n"
-        "/logout — Log out and remove saved credentials\n"
-        "/status — Check database and login status",
-        parse_mode="HTML"
-    )
+    # Ensure native Telegram command menu is active for authorized user
+    if uid:
+        try:
+            await context.bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeChat(chat_id=uid))
+        except Exception:
+            pass
+
+    if update.message:
+        await update.message.reply_text(
+            "👋 <b>Welcome!</b>\n"
+            "Use the <b>Menu</b> button below or type <code>/</code> to view all commands.",
+            parse_mode="HTML",
+        )
 
 
 async def _run_login(update: Update, username: str, password: str) -> None:
@@ -444,12 +474,94 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     uid = user.id if user else None
     session = load_session(user_id=uid)
-    db_type = "MongoDB Atlas 🍃" if storage.is_mongodb_active() else "Local SQLite 🗄️"
     
     if session and session.get("cookies"):
-        await update.message.reply_text(f"✅ You are logged in.\nDatabase backend: <b>{db_type}</b>", parse_mode="HTML")
+        await update.message.reply_text("✅ <b>Logged In:</b> Your ERP session is active.", parse_mode="HTML")
     else:
-        await update.message.reply_text(f"❌ You are logged out. Use /login first.\nDatabase backend: <b>{db_type}</b>", parse_mode="HTML")
+        await update.message.reply_text("❌ <b>Logged Out:</b> Use /login to connect your ERP account.", parse_mode="HTML")
+
+
+async def privacy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send the privacy policy explaining data collection, storage, and processing."""
+    if not is_authorized(update):
+        await update.message.reply_text("⛔ You are not authorized to use this bot.")
+        return
+
+    privacy_text = (
+        "🔒 <b>PRIVACY POLICY</b>\n\n"
+        "<b>1. Data We Store</b>\n"
+        "• <b>Telegram User ID:</b> Used as your unique account ID to link your stored preferences and credentials.\n"
+        "• <b>ERP Credentials:</b> When you use <code>/login</code>, your student username and password are encrypted with <b>Fernet (AES-128-CBC + HMAC)</b> before saving. Plaintext passwords are never stored, and password messages in chat are deleted immediately.\n"
+        "• <b>ERP Session Data:</b> Active session cookies and CSRF tokens are stored to maintain your authenticated session.\n"
+        "• <b>Alert Preferences:</b> Your daily morning schedule alert setting (enabled/disabled).\n\n"
+        "<b>2. Timetable & Live Processing</b>\n"
+        "• <b>Timetable Data:</b> Fetched on-demand live from the university ERP portal. Schedules are parsed in memory and sent directly to you; we <i>do not</i> permanently store your timetable or academic data.\n"
+        "• <b>Friend Feature (<code>/friend</code>):</b> 100% ephemeral. Credentials entered for a friend are processed in memory for a single fetch and are <i>never</i> saved to the database.\n\n"
+        "<b>3. Hosting & Infrastructure</b>\n"
+        "• <b>MongoDB Atlas:</b> Encrypted user credentials, session cookies, and settings are stored in a secured MongoDB Atlas cloud database.\n"
+        "• <b>Render:</b> The bot application runs as a secure cloud service on Render.\n"
+        "• <b>Telegram:</b> Messages and commands are transmitted via the official Telegram Bot API.\n\n"
+        "<b>4. Your Control & Data Deletion</b>\n"
+        "• <b>/logout:</b> Clears your saved ERP credentials and session cookies.\n"
+        "• <b>/delete_me:</b> Permanently wipes your entire record and all data from our database."
+    )
+
+    await update.message.reply_text(privacy_text, parse_mode="HTML")
+
+
+async def delete_me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Allow the user to permanently delete all their stored data from MongoDB."""
+    if not is_authorized(update):
+        await update.message.reply_text("⛔ You are not authorized to use this bot.")
+        return
+
+    user = update.effective_user
+    uid = user.id if user else None
+    if not uid:
+        return
+
+    arg = " ".join(context.args).strip().lower() if context.args else ""
+    if arg != "confirm":
+        await update.message.reply_text(
+            "⚠️ <b>Delete All Stored Data</b>\n\n"
+            "This will permanently delete:\n"
+            "• Your encrypted ERP credentials\n"
+            "• Your active session cookies\n"
+            "• Your morning alert settings\n"
+            "• Your entire user profile from the database\n\n"
+            "To confirm permanent deletion, send:\n"
+            "<code>/delete_me confirm</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    try:
+        deleted = storage.delete_user_all_data(uid)
+        context.user_data.clear()
+
+        # Check if morning job needs removal if no users left
+        if not storage.get_all_morning_users() and context.job_queue:
+            for job in context.job_queue.get_jobs_by_name(MORNING_TIMETABLE_JOB_NAME):
+                job.schedule_removal()
+
+        if deleted:
+            await update.message.reply_text(
+                "🗑️ <b>Your stored data has been permanently deleted.</b>\n"
+                "All your credentials, session cookies, and preferences were removed from the database.\n"
+                "You can start fresh anytime with /login.",
+                parse_mode="HTML",
+            )
+        else:
+            await update.message.reply_text(
+                "ℹ️ No stored data was found for your account in the database.",
+                parse_mode="HTML",
+            )
+    except Exception as exc:
+        logger.exception("Failed to delete user data for uid=%s", uid)
+        await update.message.reply_text(
+            "❌ Could not delete data due to a server error. Please try again later.",
+            parse_mode="HTML",
+        )
 
 
 async def _start_health_server(app: Application) -> None:
@@ -475,6 +587,32 @@ async def _start_health_server(app: Application) -> None:
         logger.warning("Could not start cloud health check server on port %s: %s", port, exc)
 
 
+async def _setup_bot_commands(app: Application) -> None:
+    """Register active Telegram commands."""
+    try:
+        if config.AUTHORIZED_TELEGRAM_USER_IDS:
+            for uid in config.AUTHORIZED_TELEGRAM_USER_IDS:
+                try:
+                    await app.bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeChat(chat_id=uid))
+                except Exception:
+                    pass
+            try:
+                await app.bot.delete_my_commands(scope=BotCommandScopeDefault())
+            except Exception:
+                pass
+        else:
+            await app.bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeDefault())
+        logger.info("Registered %d active Telegram bot commands.", len(BOT_COMMANDS))
+    except Exception as exc:
+        logger.warning("Could not register bot commands with Telegram: %s", exc)
+
+
+async def _post_init(app: Application) -> None:
+    """Post-initialization hook for cloud health check and command setup."""
+    await _start_health_server(app)
+    await _setup_bot_commands(app)
+
+
 def main() -> None:
     if not config.TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set. Check your .env file.")
@@ -484,7 +622,7 @@ def main() -> None:
         .token(config.TELEGRAM_BOT_TOKEN)
         .defaults(Defaults(protect_content=True))
         .job_queue(JobQueue())
-        .post_init(_start_health_server)
+        .post_init(_post_init)
         .build()
     )
 
@@ -494,8 +632,10 @@ def main() -> None:
     application.add_handler(CommandHandler("week", week))
     application.add_handler(CommandHandler("friend", friend))
     application.add_handler(CommandHandler("morning", morning))
-    application.add_handler(CommandHandler("logout", logout))
     application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("privacy", privacy))
+    application.add_handler(CommandHandler("delete_me", delete_me))
+    application.add_handler(CommandHandler("logout", logout))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_login_message))
 
     # Schedule the daily morning timetable job for all users with stored credentials.

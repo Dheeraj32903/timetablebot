@@ -108,7 +108,7 @@ def get_main_reply_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton("📅 Today's Schedule"), KeyboardButton("📆 Full Week")],
             [KeyboardButton("🗓️ Pick Day"), KeyboardButton("👥 Friend Schedule")],
             [KeyboardButton("⏰ Morning Alert"), KeyboardButton("⚙️ Account")],
-            [KeyboardButton("ℹ️ Status"), KeyboardButton("❓ Help")],
+            [KeyboardButton("ℹ️ Status")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -383,30 +383,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             pass
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_authorized(update):
-        if update.message:
-            await update.message.reply_text("⛔ You are not authorized to use this bot.")
-        return
-
-    help_text = (
-        "<blockquote>🤖 <b>UniTable — Quick Help Guide</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "• 📅 <b>Today's Schedule:</b> View your daily classes\n"
-        "• 📆 <b>Full Week:</b> View the entire weekly schedule\n"
-        "• 🗓️ <b>Pick Day:</b> Select any specific day (Mon–Sat)\n"
-        "• 👥 <b>Friend Schedule:</b> Check another student's timetable\n"
-        "• ⏰ <b>Morning Alert:</b> Automated daily 7 AM IST alert\n"
-        "• ⚙️ <b>Account:</b> Manage login and credentials</blockquote>\n\n"
-        "<b>Available Commands:</b>\n"
-        "/start • /timetable • /week • /friend • /morning • /status • /logout • /help"
-    )
-    if update.message:
-        await update.message.reply_text(
-            help_text,
-            parse_mode="HTML",
-            reply_markup=get_main_inline_keyboard(),
-        )
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1179,9 +1155,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         if text in {"ℹ️ Status", "Status"}:
             await status(update, context)
             return
-        if text in {"❓ Help", "Help"}:
-            await help_command(update, context)
-            return
 
     # 3. Handle login conversation step 1 (Username)
     if state == STATE_WAITING_USERNAME:
@@ -1267,7 +1240,6 @@ async def _setup_bot_commands(app: Application) -> None:
         BotCommand("morning", "⏰ Toggle daily 7 AM morning alert"),
         BotCommand("status", "ℹ️ Check ERP connection status"),
         BotCommand("logout", "🚪 Log out and remove credentials"),
-        BotCommand("help", "❓ Help & quick guide"),
     ]
     try:
         await app.bot.set_my_commands(commands)
@@ -1308,7 +1280,6 @@ def main() -> None:
     application.add_handler(CommandHandler("morning", morning))
     application.add_handler(CommandHandler("logout", logout))
     application.add_handler(CommandHandler("status", status))
-    application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
 
     # Inline Callback Query Handler

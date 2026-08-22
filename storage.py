@@ -201,3 +201,13 @@ def get_all_morning_users() -> list[int]:
     except Exception as exc:
         logger.error("Error fetching morning users from MongoDB: %s", exc)
     return user_ids
+
+
+def delete_user_all_data(user_id: int) -> bool:
+    """Completely remove all stored user data (credentials, session, morning settings) from MongoDB."""
+    try:
+        res = _mongo_db.users.delete_one({"_id": int(user_id)})
+        return res.deleted_count > 0
+    except Exception as exc:
+        logger.error("Error completely deleting user from MongoDB: %s", exc)
+        raise
