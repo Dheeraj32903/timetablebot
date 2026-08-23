@@ -81,10 +81,10 @@ def _cookies_for_request(cookies: dict) -> dict:
     return result
 
 
-async def perform_login(username: str, password: str, user_id: Optional[int] = None, max_retries: int = 2) -> dict:
+async def perform_login(username: str, password: str, user_id: Optional[int] = None, max_retries: int = 4) -> dict:
     """
     Log in to the ERP automatically using the local CAPTCHA solver.
-    Retries a few times because CAPTCHA recognition is not always perfect.
+    Retries multiple times because CAPTCHA recognition is not always 100% on first try.
     Saves and returns the authenticated session for the given user.
     """
     last_error: Optional[Exception] = None
@@ -99,7 +99,7 @@ async def perform_login(username: str, password: str, user_id: Optional[int] = N
         except Exception as exc:
             last_error = exc
             if attempt < max_retries:
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.8 * attempt)
 
     raise RuntimeError(f"Login failed after {max_retries} attempts. Last error: {last_error}")
 

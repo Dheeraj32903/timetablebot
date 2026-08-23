@@ -47,8 +47,10 @@ STATE_WAITING_PASSWORD = "waiting_password"
 
 BOT_VERSION = "5.2.0"
 
-# Daily automatic timetable message job name.
+# Daily automatic timetable message job names.
 MORNING_TIMETABLE_JOB_NAME = "morning_timetable"
+MORNING_PREFETCH_JOB_NAME = "morning_prefetch"
+_morning_cache: dict[int, str] = {}
 
 
 def _is_morning_enabled(user_id: Optional[int] = None) -> bool:
@@ -368,6 +370,8 @@ async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             if not storage.get_all_morning_users() and context.job_queue:
                 for job in context.job_queue.get_jobs_by_name(MORNING_TIMETABLE_JOB_NAME):
                     job.schedule_removal()
+                for job in context.job_queue.get_jobs_by_name(MORNING_PREFETCH_JOB_NAME):
+                    job.schedule_removal()
         except Exception as exc:
             logger.error("Error during logout for %s: %s", uid, exc)
 
@@ -376,6 +380,52 @@ async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Use /login to log in again.",
         parse_mode="HTML",
     )
+
+
+async def _prefetch_morning_timetables(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Background warmup job (starts 10 mins before 07:00 IST at 06:50 IST): pre-authenticates and pre-fetches timetables."""
+    morning_uids = storage.get_all_morning_users()
+    if not morning_uids:
+        return
+
+    logger.info("Starting morning pre-fetch warmup for %d users...", len(morning_uids))
+    _morning_cache.clear()
+    failed_users: list[tuple[int, dict]] = []
+
+    for chat_id in morning_uids:
+        saved = credentials.load_user_credentials(chat_id)
+        if not saved:
+            continue
+
+        try:
+            try:
+                html = await fetch_timetable_html(user_id=chat_id)
+            except Exception:
+                await perform_login(saved["username"], saved["password"], user_id=chat_id, max_retries=4)
+                html = await fetch_timetable_html(user_id=chat_id)
+
+            _morning_cache[chat_id] = html
+            logger.info("Pre-fetch successful for user %s", chat_id)
+        except Exception:
+            logger.warning("Pre-fetch initial attempt failed for user %s, queued for retry", chat_id)
+            failed_users.append((chat_id, saved))
+        finally:
+            await asyncio.sleep(2.0)
+
+    # Second retry pass for any failed users before 07:00 IST
+    if failed_users:
+        logger.info("Retrying pre-fetch for %d users...", len(failed_users))
+        await asyncio.sleep(5.0)
+        for chat_id, saved in failed_users:
+            try:
+                await perform_login(saved["username"], saved["password"], user_id=chat_id, max_retries=4)
+                html = await fetch_timetable_html(user_id=chat_id)
+                _morning_cache[chat_id] = html
+                logger.info("Pre-fetch retry successful for user %s", chat_id)
+            except Exception:
+                logger.exception("Pre-fetch retry failed for user %s", chat_id)
+            finally:
+                await asyncio.sleep(2.0)
 
 
 async def _send_morning_timetable(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -392,11 +442,14 @@ async def _send_morning_timetable(context: ContextTypes.DEFAULT_TYPE) -> None:
             continue
 
         try:
-            try:
-                html = await fetch_timetable_html(user_id=chat_id)
-            except Exception:
-                await perform_login(saved["username"], saved["password"], user_id=chat_id)
-                html = await fetch_timetable_html(user_id=chat_id)
+            # Use pre-fetched HTML from 06:50 warmup if available
+            html = _morning_cache.get(chat_id)
+            if not html:
+                try:
+                    html = await fetch_timetable_html(user_id=chat_id)
+                except Exception:
+                    await perform_login(saved["username"], saved["password"], user_id=chat_id, max_retries=4)
+                    html = await fetch_timetable_html(user_id=chat_id)
 
             message = format_timetable_for_telegram(html, day=today_name)
             await context.bot.send_message(
@@ -413,19 +466,20 @@ async def _send_morning_timetable(context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
             except Exception:
                 pass
+        finally:
+            await asyncio.sleep(0.5)
+
+    # Clear cache for the next day
+    _morning_cache.clear()
 
 
 def _schedule_morning_timetable_job(context) -> None:
-    """Schedule the daily morning timetable job if enabled and not already scheduled."""
+    """Schedule the daily morning timetable pre-fetch (06:50 IST) and delivery (07:00 IST) jobs."""
     if not _is_morning_enabled():
         return
 
     job_queue = getattr(context, "job_queue", None)
     if not job_queue:
-        return
-
-    current_jobs = job_queue.get_jobs_by_name(MORNING_TIMETABLE_JOB_NAME)
-    if current_jobs:
         return
 
     try:
@@ -434,22 +488,49 @@ def _schedule_morning_timetable_job(context) -> None:
     except Exception:
         tz = None
 
+    # Delivery time (e.g., 07:00 IST)
     scheduled_time = dt_time(
         hour=config.MORNING_TIMETABLE_HOUR,
         minute=config.MORNING_TIMETABLE_MINUTE,
         tzinfo=tz,
     )
 
-    job_queue.run_daily(
-        _send_morning_timetable,
-        time=scheduled_time,
-        name=MORNING_TIMETABLE_JOB_NAME,
+    # Pre-fetch warmup time (10 minutes earlier, e.g., 06:50 IST)
+    prefetch_hour = config.MORNING_TIMETABLE_HOUR
+    prefetch_minute = config.MORNING_TIMETABLE_MINUTE - 10
+    if prefetch_minute < 0:
+        prefetch_minute += 60
+        prefetch_hour = (prefetch_hour - 1) % 24
+
+    prefetch_time = dt_time(
+        hour=prefetch_hour,
+        minute=prefetch_minute,
+        tzinfo=tz,
     )
-    logger.info(
-        "Scheduled morning timetable job at %02d:%02d IST",
-        config.MORNING_TIMETABLE_HOUR,
-        config.MORNING_TIMETABLE_MINUTE,
-    )
+
+    if not job_queue.get_jobs_by_name(MORNING_PREFETCH_JOB_NAME):
+        job_queue.run_daily(
+            _prefetch_morning_timetables,
+            time=prefetch_time,
+            name=MORNING_PREFETCH_JOB_NAME,
+        )
+        logger.info(
+            "Scheduled morning pre-fetch warmup job at %02d:%02d IST",
+            prefetch_hour,
+            prefetch_minute,
+        )
+
+    if not job_queue.get_jobs_by_name(MORNING_TIMETABLE_JOB_NAME):
+        job_queue.run_daily(
+            _send_morning_timetable,
+            time=scheduled_time,
+            name=MORNING_TIMETABLE_JOB_NAME,
+        )
+        logger.info(
+            "Scheduled morning timetable delivery job at %02d:%02d IST",
+            config.MORNING_TIMETABLE_HOUR,
+            config.MORNING_TIMETABLE_MINUTE,
+        )
 
 
 async def morning(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -475,6 +556,8 @@ async def morning(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not _is_morning_enabled():
             if context.job_queue:
                 for job in context.job_queue.get_jobs_by_name(MORNING_TIMETABLE_JOB_NAME):
+                    job.schedule_removal()
+                for job in context.job_queue.get_jobs_by_name(MORNING_PREFETCH_JOB_NAME):
                     job.schedule_removal()
         await update.message.reply_text(
             "🔕 <b>Daily morning alert disabled.</b>\n"
