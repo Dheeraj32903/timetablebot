@@ -287,9 +287,9 @@ async def fetch_timetable(
         headers=headers,
         http2=False,
         follow_redirects=True,
-        timeout=30.0,
+        timeout=35.0,
     ) as client:
-        response = await client.get(tt_url, cookies=cookies, timeout=15)
+        response = await client.get(tt_url, cookies=cookies, timeout=35.0)
         response.raise_for_status()
 
         if _is_login_failed(response):

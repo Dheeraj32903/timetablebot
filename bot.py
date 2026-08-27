@@ -401,7 +401,7 @@ async def _prefetch_morning_timetables(context: ContextTypes.DEFAULT_TYPE) -> No
             try:
                 html = await fetch_timetable_html(user_id=chat_id)
             except Exception:
-                await perform_login(saved["username"], saved["password"], user_id=chat_id, max_retries=4)
+                await perform_login(saved["username"], saved["password"], user_id=chat_id)
                 html = await fetch_timetable_html(user_id=chat_id)
 
             _morning_cache[chat_id] = html
@@ -410,22 +410,22 @@ async def _prefetch_morning_timetables(context: ContextTypes.DEFAULT_TYPE) -> No
             logger.warning("Pre-fetch initial attempt failed for user %s, queued for retry", chat_id)
             failed_users.append((chat_id, saved))
         finally:
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(1.0)
 
     # Second retry pass for any failed users before 07:00 IST
     if failed_users:
         logger.info("Retrying pre-fetch for %d users...", len(failed_users))
-        await asyncio.sleep(5.0)
+        await asyncio.sleep(3.0)
         for chat_id, saved in failed_users:
             try:
-                await perform_login(saved["username"], saved["password"], user_id=chat_id, max_retries=4)
+                await perform_login(saved["username"], saved["password"], user_id=chat_id)
                 html = await fetch_timetable_html(user_id=chat_id)
                 _morning_cache[chat_id] = html
                 logger.info("Pre-fetch retry successful for user %s", chat_id)
             except Exception:
                 logger.exception("Pre-fetch retry failed for user %s", chat_id)
             finally:
-                await asyncio.sleep(2.0)
+                await asyncio.sleep(1.0)
 
 
 async def _send_morning_timetable(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -448,7 +448,7 @@ async def _send_morning_timetable(context: ContextTypes.DEFAULT_TYPE) -> None:
                 try:
                     html = await fetch_timetable_html(user_id=chat_id)
                 except Exception:
-                    await perform_login(saved["username"], saved["password"], user_id=chat_id, max_retries=4)
+                    await perform_login(saved["username"], saved["password"], user_id=chat_id)
                     html = await fetch_timetable_html(user_id=chat_id)
 
             message = format_timetable_for_telegram(html, day=today_name)
@@ -458,14 +458,27 @@ async def _send_morning_timetable(context: ContextTypes.DEFAULT_TYPE) -> None:
                 parse_mode="HTML",
             )
         except Exception:
-            logger.exception("Failed to send morning timetable to chat_id=%s", chat_id)
+            # Resilient fallback retry pass with fresh login before failing
             try:
+                logger.warning("Morning delivery first attempt failed for chat_id=%s, attempting re-login...", chat_id)
+                await asyncio.sleep(1.0)
+                await perform_login(saved["username"], saved["password"], user_id=chat_id)
+                html = await fetch_timetable_html(user_id=chat_id)
+                message = format_timetable_for_telegram(html, day=today_name)
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text="Could not fetch your morning timetable. Try /login and then /timetable.",
+                    text=f"🌅 <b>Good morning! Here is today's schedule ({today_name}):</b>\n\n{message}",
+                    parse_mode="HTML",
                 )
             except Exception:
-                pass
+                logger.exception("Failed to send morning timetable to chat_id=%s after retries", chat_id)
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text="Could not fetch your morning timetable. Try /login and then /timetable.",
+                    )
+                except Exception:
+                    pass
         finally:
             await asyncio.sleep(0.5)
 

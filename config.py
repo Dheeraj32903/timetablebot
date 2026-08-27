@@ -71,3 +71,7 @@ CREDENTIALS_ENCRYPTION_KEY = os.getenv("CREDENTIALS_ENCRYPTION_KEY", "")
 # Daily automatic morning timetable message time (IST, 24-hour format).
 MORNING_TIMETABLE_HOUR = int(os.getenv("MORNING_TIMETABLE_HOUR", "7"))
 MORNING_TIMETABLE_MINUTE = int(os.getenv("MORNING_TIMETABLE_MINUTE", "0"))
+
+# Maximum number of automated login retry attempts for CAPTCHA solving.
+LOGIN_MAX_RETRIES = int(os.getenv("LOGIN_MAX_RETRIES", "10"))
+
