@@ -16,7 +16,8 @@ services:
       - key: CREDENTIALS_ENCRYPTION_KEY
         sync: false
       - key: MORNING_TIMETABLE_HOUR
-        value: "7"
+        value: "6"
       - key: MORNING_TIMETABLE_MINUTE
-        value: "0"
+        value: "45"
+
 

@@ -69,9 +69,12 @@ ERP_PASSWORD = os.getenv("ERP_PASSWORD", "")
 CREDENTIALS_ENCRYPTION_KEY = os.getenv("CREDENTIALS_ENCRYPTION_KEY", "")
 
 # Daily automatic morning timetable message time (IST, 24-hour format).
-MORNING_TIMETABLE_HOUR = int(os.getenv("MORNING_TIMETABLE_HOUR", "7"))
-MORNING_TIMETABLE_MINUTE = int(os.getenv("MORNING_TIMETABLE_MINUTE", "0"))
+# Defaults to 06:45 AM IST (Warmup pre-fetch starts at 06:30 AM IST).
+MORNING_TIMETABLE_HOUR = int(os.getenv("MORNING_TIMETABLE_HOUR", "6"))
+MORNING_TIMETABLE_MINUTE = int(os.getenv("MORNING_TIMETABLE_MINUTE", "45"))
 
 # Maximum number of automated login retry attempts for CAPTCHA solving.
-LOGIN_MAX_RETRIES = int(os.getenv("LOGIN_MAX_RETRIES", "10"))
+# Paced with backoff and jitter to prevent hammering ERP servers.
+LOGIN_MAX_RETRIES = int(os.getenv("LOGIN_MAX_RETRIES", "6"))
+
 

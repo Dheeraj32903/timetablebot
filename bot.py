@@ -1,7 +1,9 @@
 import asyncio
 import logging
+import random
 import time
 from datetime import datetime, time as dt_time
+
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -284,6 +286,9 @@ async def timetable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             else:
                 raise
 
+        if uid:
+            storage.save_user_timetable(uid, html)
+
         messages = get_timetable_messages(html, day_filter=day)
         if not messages:
             await status_msg.edit_text("⚠️ <i>Could not extract timetable.</i>", parse_mode="HTML")
@@ -297,6 +302,17 @@ async def timetable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text(extra_msg, parse_mode="HTML")
     except Exception as exc:
         logger.exception("Failed to fetch timetable")
+        # Offline cache fallback
+        cached_html = storage.load_user_timetable(uid) if uid else None
+        if cached_html:
+            messages = get_timetable_messages(cached_html, day_filter=day)
+            if messages:
+                messages[0] += "\n\n<i>📅 Delivered from your synced schedule (offline fallback)</i>"
+                await status_msg.edit_text(messages[0], parse_mode="HTML")
+                for extra_msg in messages[1:]:
+                    await update.message.reply_text(extra_msg, parse_mode="HTML")
+                return
+
         await status_msg.edit_text(
             "❌ Could not fetch timetable.\n"
             "Try logging in again with /login."
@@ -324,6 +340,9 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             else:
                 raise
 
+        if uid:
+            storage.save_user_timetable(uid, html)
+
         messages = get_timetable_messages(html)
         if not messages:
             await status_msg.edit_text("⚠️ <i>Could not extract timetable.</i>", parse_mode="HTML")
@@ -337,10 +356,22 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text(extra_msg, parse_mode="HTML")
     except Exception as exc:
         logger.exception("Failed to fetch week timetable")
+        # Offline cache fallback
+        cached_html = storage.load_user_timetable(uid) if uid else None
+        if cached_html:
+            messages = get_timetable_messages(cached_html)
+            if messages:
+                messages[0] += "\n\n<i>📅 Delivered from your synced schedule (offline fallback)</i>"
+                await status_msg.edit_text(messages[0], parse_mode="HTML")
+                for extra_msg in messages[1:]:
+                    await update.message.reply_text(extra_msg, parse_mode="HTML")
+                return
+
         await status_msg.edit_text(
             "❌ Could not fetch timetable.\n"
             "Try logging in again with /login."
         )
+
 
 
 async def friend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -383,12 +414,12 @@ async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def _prefetch_morning_timetables(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Background warmup job (starts 10 mins before 07:00 IST at 06:50 IST): pre-authenticates and pre-fetches timetables."""
+    """Background warmup job (starts at 06:30 IST): pre-authenticates and pre-fetches timetables without rushing."""
     morning_uids = storage.get_all_morning_users()
     if not morning_uids:
         return
 
-    logger.info("Starting morning pre-fetch warmup for %d users...", len(morning_uids))
+    logger.info("Starting gentle morning pre-fetch warmup for %d users...", len(morning_uids))
     _morning_cache.clear()
     failed_users: list[tuple[int, dict]] = []
 
@@ -401,35 +432,39 @@ async def _prefetch_morning_timetables(context: ContextTypes.DEFAULT_TYPE) -> No
             try:
                 html = await fetch_timetable_html(user_id=chat_id)
             except Exception:
-                await perform_login(saved["username"], saved["password"], user_id=chat_id)
+                # Gentle login attempt
+                await perform_login(saved["username"], saved["password"], user_id=chat_id, max_retries=3)
                 html = await fetch_timetable_html(user_id=chat_id)
 
             _morning_cache[chat_id] = html
+            storage.save_user_timetable(chat_id, html)
             logger.info("Pre-fetch successful for user %s", chat_id)
         except Exception:
             logger.warning("Pre-fetch initial attempt failed for user %s, queued for retry", chat_id)
             failed_users.append((chat_id, saved))
         finally:
-            await asyncio.sleep(1.0)
+            # Space out between users to never flood the ERP
+            await asyncio.sleep(random.uniform(2.5, 4.5))
 
-    # Second retry pass for any failed users before 07:00 IST
+    # Gentle retry pass for failed users after a 10-second rest
     if failed_users:
-        logger.info("Retrying pre-fetch for %d users...", len(failed_users))
-        await asyncio.sleep(3.0)
+        logger.info("Retrying pre-fetch for %d users after cool-down...", len(failed_users))
+        await asyncio.sleep(10.0)
         for chat_id, saved in failed_users:
             try:
-                await perform_login(saved["username"], saved["password"], user_id=chat_id)
+                await perform_login(saved["username"], saved["password"], user_id=chat_id, max_retries=3)
                 html = await fetch_timetable_html(user_id=chat_id)
                 _morning_cache[chat_id] = html
+                storage.save_user_timetable(chat_id, html)
                 logger.info("Pre-fetch retry successful for user %s", chat_id)
             except Exception:
-                logger.exception("Pre-fetch retry failed for user %s", chat_id)
+                logger.warning("Pre-fetch retry failed for user %s (will fall back to cached timetable during delivery)", chat_id)
             finally:
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(random.uniform(3.0, 5.0))
 
 
 async def _send_morning_timetable(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Background job: send today's timetable to every user with morning alert enabled."""
+    """Background job: send today's timetable to every user with morning alert enabled (06:45 AM - 07:30 AM)."""
     morning_uids = storage.get_all_morning_users()
     if not morning_uids:
         logger.info("Morning timetable skipped: no users with morning alerts enabled.")
@@ -441,53 +476,55 @@ async def _send_morning_timetable(context: ContextTypes.DEFAULT_TYPE) -> None:
         if not saved:
             continue
 
-        try:
-            # Use pre-fetched HTML from 06:50 warmup if available
-            html = _morning_cache.get(chat_id)
-            if not html:
+        html = _morning_cache.get(chat_id)
+        is_fallback = False
+
+        if not html:
+            try:
                 try:
                     html = await fetch_timetable_html(user_id=chat_id)
                 except Exception:
-                    await perform_login(saved["username"], saved["password"], user_id=chat_id)
+                    # Single gentle re-login attempt
+                    await perform_login(saved["username"], saved["password"], user_id=chat_id, max_retries=3)
                     html = await fetch_timetable_html(user_id=chat_id)
+                storage.save_user_timetable(chat_id, html)
+            except Exception:
+                logger.warning("Live morning timetable fetch failed for chat_id=%s, attempting MongoDB cache fallback...", chat_id)
+                html = storage.load_user_timetable(chat_id)
+                is_fallback = True
 
-            message = format_timetable_for_telegram(html, day=today_name)
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"🌅 <b>Good morning! Here is today's schedule ({today_name}):</b>\n\n{message}",
-                parse_mode="HTML",
-            )
-        except Exception:
-            # Resilient fallback retry pass with fresh login before failing
+        if html:
             try:
-                logger.warning("Morning delivery first attempt failed for chat_id=%s, attempting re-login...", chat_id)
-                await asyncio.sleep(1.0)
-                await perform_login(saved["username"], saved["password"], user_id=chat_id)
-                html = await fetch_timetable_html(user_id=chat_id)
                 message = format_timetable_for_telegram(html, day=today_name)
+                footer = "\n\n<i>📅 Delivered from your synced schedule</i>" if is_fallback else ""
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text=f"🌅 <b>Good morning! Here is today's schedule ({today_name}):</b>\n\n{message}",
+                    text=f"🌅 <b>Good morning! Here is today's schedule ({today_name}):</b>\n\n{message}{footer}",
+                    parse_mode="HTML",
+                )
+                logger.info("Morning timetable sent successfully to chat_id=%s (fallback=%s)", chat_id, is_fallback)
+            except Exception:
+                logger.exception("Error formatting or sending morning timetable to chat_id=%s", chat_id)
+        else:
+            logger.error("No timetable available (live or cached) for chat_id=%s", chat_id)
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="⚠️ <b>Could not connect to ERP this morning.</b>\nPlease run /timetable later to view your schedule and sync your timetable for offline morning delivery.",
                     parse_mode="HTML",
                 )
             except Exception:
-                logger.exception("Failed to send morning timetable to chat_id=%s after retries", chat_id)
-                try:
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text="Could not fetch your morning timetable. Try /login and then /timetable.",
-                    )
-                except Exception:
-                    pass
-        finally:
-            await asyncio.sleep(0.5)
+                pass
 
-    # Clear cache for the next day
+        # Space out deliveries nicely between users (1.5 - 3.5 seconds)
+        await asyncio.sleep(random.uniform(1.5, 3.5))
+
+    # Clear memory cache for the next day
     _morning_cache.clear()
 
 
 def _schedule_morning_timetable_job(context) -> None:
-    """Schedule the daily morning timetable pre-fetch (06:50 IST) and delivery (07:00 IST) jobs."""
+    """Schedule the daily morning timetable pre-fetch (06:30 IST) and delivery (06:45 IST) jobs."""
     if not _is_morning_enabled():
         return
 
@@ -501,16 +538,16 @@ def _schedule_morning_timetable_job(context) -> None:
     except Exception:
         tz = None
 
-    # Delivery time (e.g., 07:00 IST)
+    # Delivery time (e.g., 06:45 IST)
     scheduled_time = dt_time(
         hour=config.MORNING_TIMETABLE_HOUR,
         minute=config.MORNING_TIMETABLE_MINUTE,
         tzinfo=tz,
     )
 
-    # Pre-fetch warmup time (10 minutes earlier, e.g., 06:50 IST)
+    # Pre-fetch warmup time (15 minutes earlier, e.g., 06:30 IST)
     prefetch_hour = config.MORNING_TIMETABLE_HOUR
-    prefetch_minute = config.MORNING_TIMETABLE_MINUTE - 10
+    prefetch_minute = config.MORNING_TIMETABLE_MINUTE - 15
     if prefetch_minute < 0:
         prefetch_minute += 60
         prefetch_hour = (prefetch_hour - 1) % 24
@@ -544,6 +581,7 @@ def _schedule_morning_timetable_job(context) -> None:
             config.MORNING_TIMETABLE_HOUR,
             config.MORNING_TIMETABLE_MINUTE,
         )
+
 
 
 async def morning(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

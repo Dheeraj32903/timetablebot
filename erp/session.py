@@ -1,5 +1,7 @@
 import asyncio
 import json
+import logging
+import random
 import re
 from pathlib import Path
 from typing import Optional
@@ -8,6 +10,9 @@ from urllib.parse import unquote
 import config
 import storage
 from erp.client import auto_login, fetch_timetable
+
+logger = logging.getLogger(__name__)
+
 
 SESSION_PATH: Path = config.SESSION_FILE
 
@@ -90,6 +95,7 @@ async def perform_login(
     """
     Log in to the ERP automatically using the local CAPTCHA solver.
     Retries multiple times because CAPTCHA recognition is not always 100% on first try.
+    Uses gentle pacing and randomized backoff to avoid flooding ERP servers.
     Saves and returns the authenticated session for the given user.
     """
     retries = max_retries if max_retries is not None else config.LOGIN_MAX_RETRIES
@@ -105,9 +111,20 @@ async def perform_login(
         except Exception as exc:
             last_error = exc
             if attempt < retries:
-                await asyncio.sleep(min(0.5 * attempt, 2.5))
+                # Never rush: space out attempts with 2s-4s gentle backoff & jitter
+                delay = 2.0 + (attempt * 0.75) + random.uniform(0.5, 1.5)
+                logger.warning(
+                    "ERP login attempt %d/%d for user %s failed: %s. Pausing %.2fs before retrying...",
+                    attempt,
+                    retries,
+                    user_id or "default",
+                    exc,
+                    delay,
+                )
+                await asyncio.sleep(delay)
 
     raise RuntimeError(f"Login failed after {retries} attempts. Last error: {last_error}")
+
 
 
 async def fetch_timetable_html(

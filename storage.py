@@ -203,11 +203,43 @@ def get_all_morning_users() -> list[int]:
     return user_ids
 
 
+def save_user_timetable(user_id: int, timetable_html: str) -> None:
+    """Save the latest fetched timetable HTML for a user to MongoDB for offline fallback."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        _mongo_db.users.update_one(
+            {"_id": int(user_id)},
+            {
+                "$set": {
+                    "cached_timetable": {
+                        "html": timetable_html,
+                        "updated_at": now_iso,
+                    }
+                }
+            },
+            upsert=True,
+        )
+    except Exception as exc:
+        logger.error("Error saving cached timetable in MongoDB: %s", exc)
+
+
+def load_user_timetable(user_id: int) -> Optional[str]:
+    """Load the latest cached timetable HTML for a user from MongoDB."""
+    try:
+        doc = _mongo_db.users.find_one({"_id": int(user_id)})
+        if doc and doc.get("cached_timetable"):
+            return doc["cached_timetable"].get("html")
+    except Exception as exc:
+        logger.error("Error loading cached timetable from MongoDB: %s", exc)
+    return None
+
+
 def delete_user_all_data(user_id: int) -> bool:
-    """Completely remove all stored user data (credentials, session, morning settings) from MongoDB."""
+    """Completely remove all stored user data (credentials, session, morning settings, timetable) from MongoDB."""
     try:
         res = _mongo_db.users.delete_one({"_id": int(user_id)})
         return res.deleted_count > 0
     except Exception as exc:
         logger.error("Error completely deleting user from MongoDB: %s", exc)
         raise
+
