@@ -235,11 +235,153 @@ def load_user_timetable(user_id: int) -> Optional[str]:
 
 
 def delete_user_all_data(user_id: int) -> bool:
-    """Completely remove all stored user data (credentials, session, morning settings, timetable) from MongoDB."""
+    """Completely remove all stored user data (credentials, session, morning settings, timetable, LMS) from MongoDB."""
     try:
         res = _mongo_db.users.delete_one({"_id": int(user_id)})
         return res.deleted_count > 0
     except Exception as exc:
         logger.error("Error completely deleting user from MongoDB: %s", exc)
         raise
+
+
+# ---------------------------------------------------------------------------
+# LMS Credentials, Token & Task Tracking (Per-User)
+# ---------------------------------------------------------------------------
+
+def save_user_lms_credentials(user_id: int, username_encrypted: str, password_encrypted: str) -> None:
+    """Save encrypted LMS credentials for a user in MongoDB."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        _mongo_db.users.update_one(
+            {"_id": int(user_id)},
+            {
+                "$set": {
+                    "lms_username": username_encrypted,
+                    "lms_password": password_encrypted,
+                    "lms_updated_at": now_iso,
+                },
+                "$setOnInsert": {
+                    "created_at": now_iso,
+                },
+            },
+            upsert=True,
+        )
+    except Exception as exc:
+        logger.error("Error saving LMS credentials to MongoDB: %s", exc)
+        raise
+
+
+def load_user_lms_credentials(user_id: int) -> Optional[dict]:
+    """Load encrypted LMS credentials record for a specific user from MongoDB."""
+    try:
+        doc = _mongo_db.users.find_one({"_id": int(user_id)})
+        if doc and doc.get("lms_username") and doc.get("lms_password"):
+            return {
+                "username": doc["lms_username"],
+                "password": doc["lms_password"],
+            }
+    except Exception as exc:
+        logger.error("Error loading LMS credentials from MongoDB: %s", exc)
+    return None
+
+
+def delete_user_lms_credentials(user_id: int) -> None:
+    """Delete a user's stored LMS credentials, token, and task state in MongoDB."""
+    try:
+        _mongo_db.users.update_one(
+            {"_id": int(user_id)},
+            {"$unset": {"lms_username": "", "lms_password": "", "lms_token": "", "lms_tasks": ""}},
+        )
+    except Exception as exc:
+        logger.error("Error deleting LMS credentials in MongoDB: %s", exc)
+        raise
+
+
+def save_user_lms_token(user_id: int, token: str) -> None:
+    """Cache Moodle REST API token for a user in MongoDB."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        _mongo_db.users.update_one(
+            {"_id": int(user_id)},
+            {
+                "$set": {
+                    "lms_token": token,
+                    "lms_token_updated_at": now_iso,
+                }
+            },
+            upsert=True,
+        )
+    except Exception as exc:
+        logger.error("Error saving LMS token in MongoDB: %s", exc)
+
+
+def load_user_lms_token(user_id: int) -> Optional[str]:
+    """Load cached Moodle REST API token for a user from MongoDB."""
+    try:
+        doc = _mongo_db.users.find_one({"_id": int(user_id)})
+        if doc and doc.get("lms_token"):
+            return doc["lms_token"]
+    except Exception as exc:
+        logger.error("Error loading LMS token from MongoDB: %s", exc)
+    return None
+
+
+def get_lms_task_state(user_id: int) -> dict:
+    """
+    Get user's recorded LMS task state:
+    - seen_task_ids: list of assignment/quiz IDs previously seen (used to detect NEW tasks)
+    - reminded_48h: list of task IDs that received the 2-day reminder
+    - reminded_6h: list of task IDs that received the urgent 6-hour reminder
+    """
+    try:
+        doc = _mongo_db.users.find_one({"_id": int(user_id)})
+        if doc and doc.get("lms_tasks"):
+            return {
+                "seen_task_ids": doc["lms_tasks"].get("seen_task_ids", []),
+                "reminded_48h": doc["lms_tasks"].get("reminded_48h", []),
+                "reminded_6h": doc["lms_tasks"].get("reminded_6h", []),
+            }
+    except Exception as exc:
+        logger.error("Error loading LMS task state from MongoDB: %s", exc)
+    return {"seen_task_ids": [], "reminded_48h": [], "reminded_6h": []}
+
+
+def update_lms_task_state(
+    user_id: int,
+    seen_task_ids: list[str],
+    reminded_48h: list[str],
+    reminded_6h: list[str],
+) -> None:
+    """Update user's seen and reminded LMS task IDs in MongoDB."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        _mongo_db.users.update_one(
+            {"_id": int(user_id)},
+            {
+                "$set": {
+                    "lms_tasks": {
+                        "seen_task_ids": seen_task_ids,
+                        "reminded_48h": reminded_48h,
+                        "reminded_6h": reminded_6h,
+                        "updated_at": now_iso,
+                    }
+                }
+            },
+            upsert=True,
+        )
+    except Exception as exc:
+        logger.error("Error updating LMS task state in MongoDB: %s", exc)
+
+
+def get_all_lms_users() -> list[int]:
+    """Get all user IDs that have LMS credentials stored."""
+    user_ids = []
+    try:
+        cursor = _mongo_db.users.find({"lms_username": {"$exists": True, "$ne": ""}})
+        for doc in cursor:
+            user_ids.append(int(doc["_id"]))
+    except Exception as exc:
+        logger.error("Error fetching LMS users from MongoDB: %s", exc)
+    return user_ids
+
 

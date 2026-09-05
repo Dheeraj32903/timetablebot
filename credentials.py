@@ -137,3 +137,42 @@ def all_user_credentials() -> dict:
             }
     return result
 
+
+def save_user_lms_credentials(telegram_user_id: int, username: str, password: str) -> None:
+    """Store LMS credentials for a Telegram user with Fernet encryption in MongoDB."""
+    enc_user = _encrypt_val(username)
+    enc_pass = _encrypt_val(password)
+    storage.save_user_lms_credentials(telegram_user_id, enc_user, enc_pass)
+
+
+def load_user_lms_credentials(telegram_user_id: int) -> Optional[dict]:
+    """Load and decrypt stored LMS credentials for a Telegram user."""
+    record = storage.load_user_lms_credentials(telegram_user_id)
+    if record:
+        return {
+            "username": _decrypt_val(record["username"]),
+            "password": _decrypt_val(record["password"]),
+        }
+    return None
+
+
+def delete_user_lms_credentials(telegram_user_id: int) -> None:
+    """Remove stored LMS credentials and state for a Telegram user."""
+    storage.delete_user_lms_credentials(telegram_user_id)
+
+
+def save_user_lms_token(telegram_user_id: int, token: str) -> None:
+    """Store LMS API token encrypted with Fernet in MongoDB."""
+    enc_token = _encrypt_val(token)
+    storage.save_user_lms_token(telegram_user_id, enc_token)
+
+
+def load_user_lms_token(telegram_user_id: int) -> Optional[str]:
+    """Load and decrypt stored LMS API token from MongoDB."""
+    raw = storage.load_user_lms_token(telegram_user_id)
+    if raw:
+        return _decrypt_val(raw)
+    return None
+
+
+

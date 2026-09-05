@@ -11,11 +11,14 @@ from telegram import (
     BotCommand,
     BotCommandScopeChat,
     BotCommandScopeDefault,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     Update,
 )
 from telegram.constants import ChatMemberStatus
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     ChatMemberHandler,
     CommandHandler,
     ContextTypes,
@@ -36,6 +39,8 @@ from parser.timetable import (
     _today_day_name,
     resolve_day_name,
 )
+from lms.client import LMSClient
+from lms.service import LMSService
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -46,12 +51,15 @@ logger = logging.getLogger(__name__)
 # Conversation states for collecting credentials in Telegram chat.
 STATE_WAITING_USERNAME = "waiting_username"
 STATE_WAITING_PASSWORD = "waiting_password"
+STATE_WAITING_LMS_USERNAME = "waiting_lms_username"
+STATE_WAITING_LMS_PASSWORD = "waiting_lms_password"
 
-BOT_VERSION = "5.2.0"
+BOT_VERSION = "5.3.0"
 
 # Daily automatic timetable message job names.
 MORNING_TIMETABLE_JOB_NAME = "morning_timetable"
 MORNING_PREFETCH_JOB_NAME = "morning_prefetch"
+LMS_ALERTS_JOB_NAME = "lms_alerts_checker"
 _morning_cache: dict[int, str] = {}
 
 
@@ -81,12 +89,15 @@ BOT_COMMANDS = [
     BotCommand("timetable", "Today's classes, timings & rooms"),
     BotCommand("week", "Full weekly timetable view"),
     BotCommand("friend", "Check your friend's timetable"),
+    BotCommand("submissions", "Pending assignments & LMS deadlines"),
     BotCommand("login", "Connect & save ERP credentials"),
+    BotCommand("lms_login", "Connect & save LMS credentials"),
+    BotCommand("lms_logout", "Disconnect LMS credentials"),
     BotCommand("morning", "Sends the day's schedule daily at 7 AM"),
     BotCommand("status", "Check ERP connection status"),
     BotCommand("description", "Why use this bot & key benefits"),
     BotCommand("privacy", "View bot privacy policy"),
-    BotCommand("logout", "Log out & clear your data"),
+    BotCommand("logout", "Log out ERP & clear your data"),
 ]
 
 
@@ -115,13 +126,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             pass
 
     welcome_text = (
-        "🎓 <b>Your Timetable Assistant welcomes you!</b>\n\n"
-        "Your classes, schedule &amp; rooms — all in one place.\n\n"
+        "🎓 <b>Your KL University Assistant welcomes you!</b>\n\n"
+        "Timetable, ERP schedule &amp; LMS pending submissions — all in one place.\n\n"
         "✨ <b>What you can do:</b>\n\n"
-        "📅 Check today's classes &amp; room numbers\n\n"
-        "🗓️ View your full weekly timetable\n\n"
-        "⏰ Get daily morning schedule alerts\n\n"
-        "👥 Check your friends' schedules\n\n"
+        "📅 Check today's classes &amp; room numbers (<code>/timetable</code>)\n\n"
+        "🗓️ View your full weekly timetable (<code>/week</code>)\n\n"
+        "📋 <b>Track pending LMS HAs, ALMs &amp; deadlines</b> (<code>/submissions</code>)\n\n"
+        "⏰ Get daily morning schedule alerts (<code>/morning</code>)\n\n"
+        "👥 Check your friends' schedules (<code>/friend</code>)\n\n"
         "👇 Tap the Menu button below ( or ) Type  /  to view commands"
     )
 
@@ -206,7 +218,7 @@ async def login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def handle_login_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle username/password replies during the /login or /friend conversation."""
+    """Handle username/password replies during the /login, /friend, or /lms conversation."""
     if not is_authorized(update):
         await update.message.reply_text("⛔ You are not authorized to use this bot.")
         return
@@ -219,9 +231,11 @@ async def handle_login_message(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data.pop("login_state", None)
         context.user_data.pop("friend_login", None)
         context.user_data.pop("erp_username", None)
+        context.user_data.pop("lms_username", None)
         await update.message.reply_text("❌ Action cancelled.")
         return
 
+    # --- ERP / Friend Login Flow ---
     if state == STATE_WAITING_USERNAME:
         context.user_data["erp_username"] = text
         context.user_data["login_state"] = STATE_WAITING_PASSWORD
@@ -250,10 +264,353 @@ async def handle_login_message(update: Update, context: ContextTypes.DEFAULT_TYP
             await _run_login(update, username, password)
         return
 
+    # --- LMS Login Flow ---
+    if state == STATE_WAITING_LMS_USERNAME:
+        context.user_data["lms_username"] = text
+        context.user_data["login_state"] = STATE_WAITING_LMS_PASSWORD
+        await update.message.reply_text(
+            "<b>🔗Connect to LMS</b>\n\n"
+            "Please enter your password:\n"
+            "<i>(Your message will be automatically deleted)</i>",
+            parse_mode="HTML",
+        )
+        return
+
+    if state == STATE_WAITING_LMS_PASSWORD:
+        username = context.user_data.pop("lms_username", "")
+        context.user_data.pop("login_state", None)
+        password = text
+
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
+        if not username:
+            await update.message.reply_text("⚠️ Something went wrong. Please run /lms_login to try again.")
+            return
+
+        await _run_lms_login(update, context, username, password)
+        return
+
     # If we are not in a login conversation, ignore plain text.
     await update.message.reply_text(
-        "💡 Use /login to log in, /timetable for today's timetable, /week for the full week, or /friend for another user's timetable."
+        "💡 Use /timetable for today's classes, /submissions for pending assignments &amp; deadlines, or /login to connect ERP.",
+        parse_mode="HTML",
     )
+
+
+# ---------------------------------------------------------------------------
+# LMS Handlers & Deadline Alerts
+# ---------------------------------------------------------------------------
+
+async def _run_lms_login(update: Update, context: ContextTypes.DEFAULT_TYPE, username: str, password: str) -> None:
+    """Authenticate with KL Moodle LMS, encrypt credentials in MongoDB, and fetch pending tasks."""
+    user = update.effective_user
+    uid = user.id if user else None
+    if not uid:
+        return
+
+    status_msg = await update.message.reply_text("⏳ <b>Connecting to KL LMS...</b>", parse_mode="HTML")
+    try:
+        client = LMSClient()
+        token = await client.get_moodle_token(username, password)
+
+        # Save credentials with 256-bit Fernet encryption in MongoDB
+        credentials.save_user_lms_credentials(uid, username, password)
+        credentials.save_user_lms_token(uid, token)
+
+        try:
+            site_info = await client.get_site_info()
+            fullname = site_info.get("fullname", username)
+        except Exception:
+            fullname = username
+
+        await status_msg.edit_text(
+            f"✅ <b>LMS Connected Successfully!</b>\n"
+            f"Welcome, <b>{fullname}</b> (ID: <code>{username}</code>).\n\n"
+            f"Fetching your pending tasks and deadlines...",
+            parse_mode="HTML",
+        )
+        await _send_lms_pending_tasks(update, context, uid)
+    except ValueError as exc:
+        await status_msg.edit_text(
+            f"❌ <b>LMS Login Failed</b>\n{str(exc)}\n\nPlease try /lms_login again with your correct Student ID and password.",
+            parse_mode="HTML",
+        )
+    except Exception as exc:
+        logger.exception("LMS login failed: %s", exc)
+        await status_msg.edit_text(
+            "❌ <b>Could not connect to KL LMS.</b>\nPlease verify your connection and try again later.",
+            parse_mode="HTML",
+        )
+
+
+async def _send_lms_pending_tasks(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    message_to_edit=None,
+    force_refresh: bool = False,
+) -> None:
+    """Fetch pending tasks from LMS and display the interactive card."""
+    try:
+        tasks = await LMSService.fetch_all_pending_tasks(user_id, force_refresh=force_refresh)
+        _, student_name = await LMSService.get_authenticated_client(user_id)
+        formatted_text = LMSService.format_tasks_telegram_message(tasks, student_name=student_name)
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("🔄 Refresh Tasks", callback_data="lms:refresh"),
+                InlineKeyboardButton("🚪 Disconnect LMS", callback_data="lms:logout"),
+            ]
+        ])
+
+        # Track seen tasks to prevent duplicate alerts
+        state = storage.get_lms_task_state(user_id)
+        current_seen = set(state.get("seen_task_ids", []))
+        for t in tasks:
+            current_seen.add(t.id)
+        storage.update_lms_task_state(
+            user_id,
+            list(current_seen),
+            state.get("reminded_48h", []),
+            state.get("reminded_6h", []),
+        )
+
+        if message_to_edit:
+            await message_to_edit.edit_text(
+                formatted_text,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
+        else:
+            await update.effective_message.reply_text(
+                formatted_text,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
+    except Exception as exc:
+        logger.exception("Error fetching pending tasks for user %s: %s", user_id, exc)
+        err_msg = (
+            "⚠️ <b>Could not fetch LMS tasks.</b>\n"
+            f"<i>{str(exc)}</i>\n\n"
+            "If your LMS password changed, please run /lms_login to reconnect."
+        )
+        if message_to_edit:
+            await message_to_edit.edit_text(err_msg, parse_mode="HTML")
+        else:
+            await update.effective_message.reply_text(err_msg, parse_mode="HTML")
+
+
+async def submissions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """View pending HAs, ALMs, quizzes, and deadlines from KL LMS."""
+    if not is_authorized(update):
+        await update.message.reply_text("⛔ You are not authorized to use this bot.")
+        return
+
+    user = update.effective_user
+    if not user:
+        return
+
+    saved_lms = credentials.load_user_lms_credentials(user.id)
+    if not saved_lms:
+        # Submissions are strictly visible only if the user is logged into LMS
+        await update.message.reply_text(
+            "<b>LMS Not Connected</b>\n\n"
+            "Please connect your KL LMS account first using /lms_login to view your pending submissions and deadlines.",
+            parse_mode="HTML",
+        )
+        return
+
+    # Check for warm in-memory cache for ultra-fast instant rendering
+    now = time.time()
+    cached = LMSService._task_cache.get(user.id)
+    if cached and (now - cached[0] < 120):
+        await _send_lms_pending_tasks(update, context, user.id, force_refresh=False)
+        return
+
+    status_msg = await update.message.reply_text("⏳ <b>Fetching your submissions from LMS...</b>", parse_mode="HTML")
+    await _send_lms_pending_tasks(update, context, user.id, message_to_edit=status_msg, force_refresh=False)
+
+
+# Keep /lms as an alias to /submissions
+lms = submissions
+
+
+async def lms_login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Connect or update stored LMS credentials."""
+    if not is_authorized(update):
+        await update.message.reply_text("⛔ You are not authorized to use this bot.")
+        return
+
+    context.user_data["login_state"] = STATE_WAITING_LMS_USERNAME
+    await update.message.reply_text(
+        "<b>Connect to LMS</b>\n\n"
+        "Please enter your username:",
+        parse_mode="HTML",
+    )
+
+
+async def lms_logout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Disconnect and purge stored LMS credentials."""
+    if not is_authorized(update):
+        await update.message.reply_text("⛔ You are not authorized to use this bot.")
+        return
+
+    user = update.effective_user
+    if not user:
+        return
+
+    credentials.delete_user_lms_credentials(user.id)
+    LMSService.invalidate_user_cache(user.id)
+    await update.message.reply_text(
+        "✅ <b>LMS Disconnected.</b>\nYour stored LMS credentials, tokens, and alert history have been completely removed.",
+        parse_mode="HTML",
+    )
+
+
+async def handle_lms_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle inline button clicks on the LMS card view."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    user = update.effective_user
+    if not user or not is_authorized(update):
+        return
+
+    if data == "lms:refresh":
+        await query.edit_message_text("🔄 <i>Refreshing pending tasks from LMS...</i>", parse_mode="HTML")
+        await _send_lms_pending_tasks(update, context, user.id, message_to_edit=query.message, force_refresh=True)
+    elif data == "lms:logout":
+        credentials.delete_user_lms_credentials(user.id)
+        LMSService.invalidate_user_cache(user.id)
+        await query.edit_message_text(
+            "✅ <b>LMS Disconnected.</b>\nYour LMS credentials have been removed. Use /lms_login to reconnect anytime.",
+            parse_mode="HTML",
+        )
+    elif data == "lms:cancel_login":
+        context.user_data.pop("login_state", None)
+        context.user_data.pop("lms_username", None)
+        await query.edit_message_text("❌ <b>LMS connection cancelled.</b>", parse_mode="HTML")
+
+
+async def check_lms_deadlines_and_new_tasks(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Periodic background job:
+    1. Detects newly assigned tasks in any subject.
+    2. Sends 2-Day Deadline reminder (<= 48h remaining).
+    3. Sends Urgent Same-Day alert (<= 6h remaining).
+    """
+    user_ids = storage.get_all_lms_users()
+    if not user_ids:
+        return
+
+    logger.info("Running periodic LMS deadline & new task scan for %d users...", len(user_ids))
+
+    for uid in user_ids:
+        try:
+            tasks = await LMSService.fetch_all_pending_tasks(uid)
+            state = storage.get_lms_task_state(uid)
+            seen_ids = set(state.get("seen_task_ids", []))
+            reminded_48h = set(state.get("reminded_48h", []))
+            reminded_6h = set(state.get("reminded_6h", []))
+
+            is_first_sync = len(seen_ids) == 0
+
+            # 1. Detect New Tasks
+            for task in tasks:
+                if not is_first_sync and task.id not in seen_ids and task.seconds_remaining > 0:
+                    alert_text = LMSService.format_new_task_alert(task)
+                    btn_kb = InlineKeyboardMarkup([[InlineKeyboardButton("Open LMS Submission", url=task.url)]]) if task.url else None
+                    try:
+                        await context.bot.send_message(
+                            chat_id=uid,
+                            text=alert_text,
+                            parse_mode="HTML",
+                            reply_markup=btn_kb,
+                            disable_web_page_preview=True,
+                        )
+                        logger.info("Sent new LMS task alert (%s) to user %s", task.id, uid)
+                        await asyncio.sleep(1.5)
+                    except Exception as exc:
+                        logger.warning("Could not send new task alert to user %s: %s", uid, exc)
+
+                seen_ids.add(task.id)
+
+            # 2. Check 2-Day (48h) Deadlines
+            for task in tasks:
+                rem_secs = task.seconds_remaining
+                if 6 * 3600 < rem_secs <= 48 * 3600:
+                    if task.id not in reminded_48h:
+                        alert_text = LMSService.format_2day_reminder_alert(task)
+                        btn_kb = InlineKeyboardMarkup([[InlineKeyboardButton("Open LMS Submission", url=task.url)]]) if task.url else None
+                        try:
+                            await context.bot.send_message(
+                                chat_id=uid,
+                                text=alert_text,
+                                parse_mode="HTML",
+                                reply_markup=btn_kb,
+                                disable_web_page_preview=True,
+                            )
+                            reminded_48h.add(task.id)
+                            logger.info("Sent 2-day reminder for task %s to user %s", task.id, uid)
+                            await asyncio.sleep(1.5)
+                        except Exception as exc:
+                            logger.warning("Could not send 2-day reminder to user %s: %s", uid, exc)
+
+            # 3. Check Urgent (<6h) Deadlines
+            for task in tasks:
+                rem_secs = task.seconds_remaining
+                if 0 < rem_secs <= 6 * 3600:
+                    if task.id not in reminded_6h:
+                        alert_text = LMSService.format_urgent_reminder_alert(task)
+                        btn_kb = InlineKeyboardMarkup([[InlineKeyboardButton("Submit on LMS Now", url=task.url)]]) if task.url else None
+                        try:
+                            await context.bot.send_message(
+                                chat_id=uid,
+                                text=alert_text,
+                                parse_mode="HTML",
+                                reply_markup=btn_kb,
+                                disable_web_page_preview=True,
+                            )
+                            reminded_6h.add(task.id)
+                            logger.info("Sent urgent reminder for task %s to user %s", task.id, uid)
+                            await asyncio.sleep(1.5)
+                        except Exception as exc:
+                            logger.warning("Could not send urgent alert to user %s: %s", uid, exc)
+
+            # Save state
+            storage.update_lms_task_state(
+                uid,
+                list(seen_ids),
+                list(reminded_48h),
+                list(reminded_6h),
+            )
+
+        except Exception as exc:
+            logger.error("Error during LMS scan for user %s: %s", uid, exc)
+
+        await asyncio.sleep(2.0)
+
+
+def _schedule_lms_alerts_job(application: Application) -> None:
+    """Schedule the periodic LMS deadline & new task alert job (every 60 minutes)."""
+    job_queue = application.job_queue
+    if not job_queue:
+        return
+
+    if not job_queue.get_jobs_by_name(LMS_ALERTS_JOB_NAME):
+        job_queue.run_repeating(
+            check_lms_deadlines_and_new_tasks,
+            interval=3600,
+            first=60,
+            name=LMS_ALERTS_JOB_NAME,
+        )
+        logger.info("Scheduled periodic LMS deadline & new task alert job (every 60 mins)")
 
 
 async def timetable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -286,12 +643,9 @@ async def timetable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             else:
                 raise
 
-        if uid:
-            storage.save_user_timetable(uid, html)
-
         messages = get_timetable_messages(html, day_filter=day)
         if not messages:
-            await status_msg.edit_text("⚠️ <i>Could not extract timetable.</i>", parse_mode="HTML")
+            await status_msg.edit_text("⚠️ <i>Could not extract timetable. Please check in ERP.</i>", parse_mode="HTML")
             return
 
         await status_msg.edit_text(
@@ -302,20 +656,10 @@ async def timetable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text(extra_msg, parse_mode="HTML")
     except Exception as exc:
         logger.exception("Failed to fetch timetable")
-        # Offline cache fallback
-        cached_html = storage.load_user_timetable(uid) if uid else None
-        if cached_html:
-            messages = get_timetable_messages(cached_html, day_filter=day)
-            if messages:
-                messages[0] += "\n\n<i>📅 Delivered from your synced schedule (offline fallback)</i>"
-                await status_msg.edit_text(messages[0], parse_mode="HTML")
-                for extra_msg in messages[1:]:
-                    await update.message.reply_text(extra_msg, parse_mode="HTML")
-                return
-
         await status_msg.edit_text(
-            "❌ Could not fetch timetable.\n"
-            "Try logging in again with /login."
+            "⚠️ <b>Unable to fetch live timetable from ERP.</b>\n"
+            "Please check directly in the ERP portal or try again later.",
+            parse_mode="HTML",
         )
 
 
@@ -340,12 +684,9 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             else:
                 raise
 
-        if uid:
-            storage.save_user_timetable(uid, html)
-
         messages = get_timetable_messages(html)
         if not messages:
-            await status_msg.edit_text("⚠️ <i>Could not extract timetable.</i>", parse_mode="HTML")
+            await status_msg.edit_text("⚠️ <i>Could not extract timetable. Please check in ERP.</i>", parse_mode="HTML")
             return
 
         await status_msg.edit_text(
@@ -356,20 +697,10 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text(extra_msg, parse_mode="HTML")
     except Exception as exc:
         logger.exception("Failed to fetch week timetable")
-        # Offline cache fallback
-        cached_html = storage.load_user_timetable(uid) if uid else None
-        if cached_html:
-            messages = get_timetable_messages(cached_html)
-            if messages:
-                messages[0] += "\n\n<i>📅 Delivered from your synced schedule (offline fallback)</i>"
-                await status_msg.edit_text(messages[0], parse_mode="HTML")
-                for extra_msg in messages[1:]:
-                    await update.message.reply_text(extra_msg, parse_mode="HTML")
-                return
-
         await status_msg.edit_text(
-            "❌ Could not fetch timetable.\n"
-            "Try logging in again with /login."
+            "⚠️ <b>Unable to fetch live timetable from ERP.</b>\n"
+            "Please check directly in the ERP portal or try again later.",
+            parse_mode="HTML",
         )
 
 
@@ -437,7 +768,6 @@ async def _prefetch_morning_timetables(context: ContextTypes.DEFAULT_TYPE) -> No
                 html = await fetch_timetable_html(user_id=chat_id)
 
             _morning_cache[chat_id] = html
-            storage.save_user_timetable(chat_id, html)
             logger.info("Pre-fetch successful for user %s", chat_id)
         except Exception:
             logger.warning("Pre-fetch initial attempt failed for user %s, queued for retry", chat_id)
@@ -455,10 +785,9 @@ async def _prefetch_morning_timetables(context: ContextTypes.DEFAULT_TYPE) -> No
                 await perform_login(saved["username"], saved["password"], user_id=chat_id, max_retries=3)
                 html = await fetch_timetable_html(user_id=chat_id)
                 _morning_cache[chat_id] = html
-                storage.save_user_timetable(chat_id, html)
                 logger.info("Pre-fetch retry successful for user %s", chat_id)
             except Exception:
-                logger.warning("Pre-fetch retry failed for user %s (will fall back to cached timetable during delivery)", chat_id)
+                logger.warning("Pre-fetch retry failed for user %s", chat_id)
             finally:
                 await asyncio.sleep(random.uniform(3.0, 5.0))
 
@@ -477,7 +806,6 @@ async def _send_morning_timetable(context: ContextTypes.DEFAULT_TYPE) -> None:
             continue
 
         html = _morning_cache.get(chat_id)
-        is_fallback = False
 
         if not html:
             try:
@@ -487,30 +815,27 @@ async def _send_morning_timetable(context: ContextTypes.DEFAULT_TYPE) -> None:
                     # Single gentle re-login attempt
                     await perform_login(saved["username"], saved["password"], user_id=chat_id, max_retries=3)
                     html = await fetch_timetable_html(user_id=chat_id)
-                storage.save_user_timetable(chat_id, html)
             except Exception:
-                logger.warning("Live morning timetable fetch failed for chat_id=%s, attempting MongoDB cache fallback...", chat_id)
-                html = storage.load_user_timetable(chat_id)
-                is_fallback = True
+                logger.warning("Live morning timetable fetch failed for chat_id=%s", chat_id)
+                html = None
 
         if html:
             try:
                 message = format_timetable_for_telegram(html, day=today_name)
-                footer = "\n\n<i>📅 Delivered from your synced schedule</i>" if is_fallback else ""
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text=f"🌅 <b>Good morning! Here is today's schedule ({today_name}):</b>\n\n{message}{footer}",
+                    text=f"🌅 <b>Good morning! Here is today's schedule ({today_name}):</b>\n\n{message}",
                     parse_mode="HTML",
                 )
-                logger.info("Morning timetable sent successfully to chat_id=%s (fallback=%s)", chat_id, is_fallback)
+                logger.info("Morning timetable sent successfully to chat_id=%s", chat_id)
             except Exception:
                 logger.exception("Error formatting or sending morning timetable to chat_id=%s", chat_id)
         else:
-            logger.error("No timetable available (live or cached) for chat_id=%s", chat_id)
+            logger.error("Unable to fetch live timetable for chat_id=%s", chat_id)
             try:
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text="⚠️ <b>Could not connect to ERP this morning.</b>\nPlease run /timetable later to view your schedule and sync your timetable for offline morning delivery.",
+                    text="⚠️ <b>Unable to fetch live timetable from ERP this morning.</b>\nPlease check directly in the ERP portal.",
                     parse_mode="HTML",
                 )
             except Exception:
@@ -650,21 +975,23 @@ async def privacy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     privacy_text = (
-        "🔒 <b>PRIVACY POLICY</b>\n\n"
-        "<b>1. Data We Store</b>\n"
-        "• <b>Telegram User ID:</b> Used as your unique account ID to link your stored preferences and credentials.\n"
-        "• <b>ERP Credentials:</b> When you use <code>/login</code>, your student username and password are encrypted with <b>Fernet (AES-128-CBC + HMAC)</b> before saving. Plaintext passwords are never stored, and password messages in chat are deleted immediately.\n"
-        "• <b>ERP Session Data:</b> Active session cookies and CSRF tokens are stored to maintain your authenticated session.\n"
-        "• <b>Alert Preferences:</b> Your daily morning schedule alert setting (enabled/disabled).\n\n"
-        "<b>2. Timetable & Live Processing</b>\n"
-        "• <b>Timetable Data:</b> Fetched on-demand live from the university ERP portal. Schedules are parsed in memory and sent directly to you; we <i>do not</i> permanently store your timetable or academic data.\n"
-        "• <b>Friend Feature (<code>/friend</code>):</b> 100% ephemeral. Credentials entered for a friend are processed in memory for a single fetch and are <i>never</i> saved to the database.\n\n"
-        "<b>3. Hosting & Infrastructure</b>\n"
-        "• <b>MongoDB Atlas:</b> Encrypted user credentials, session cookies, and settings are stored in a secured MongoDB Atlas cloud database.\n"
-        "• <b>Render:</b> The bot application runs as a secure cloud service on Render.\n"
-        "• <b>Telegram:</b> Messages and commands are transmitted via the official Telegram Bot API.\n\n"
-        "<b>4. Your Control & Data Deletion</b>\n"
-        "• <b>/logout:</b> Clears your saved ERP credentials, active sessions, and data from the database."
+        "<b>PRIVACY POLICY</b>\n\n"
+        "<b>1. Data Storage & Encryption</b>\n"
+        "• <b>Telegram User ID:</b> Used as your unique account ID to link your preferences and encrypted sessions.\n"
+        "• <b>ERP & LMS Credentials:</b> When you link your accounts via <code>/login</code> or <code>/lms_login</code>, your student usernames, passwords, and API session tokens are encrypted using <b>authenticated Fernet (AES-128-CBC + HMAC-SHA256)</b> before saving to MongoDB. Plaintext passwords are never stored.\n"
+        "• <b>Chat Security:</b> Password messages sent in Telegram chat are automatically deleted immediately upon receipt.\n"
+        "• <b>Preferences:</b> Stored settings include your daily 7:00 AM morning schedule alert and notification tracking states.\n\n"
+        "<b>2. Live Processing & Ephemeral Data</b>\n"
+        "• <b>Timetable & LMS Tasks:</b> Schedules and pending assignments are fetched on-demand live from university portals. We do not permanently store your academic records.\n"
+        "• <b>Friend Feature (/friend):</b> 100% ephemeral. Credentials entered for a friend are processed in memory for a single fetch and are never stored in the database.\n\n"
+        "<b>3. Infrastructure</b>\n"
+        "• <b>MongoDB Atlas:</b> Encrypted user credentials, session cookies, and settings are stored in an enterprise-grade secured cloud database.\n"
+        "• <b>Cloud Deployment:</b> The bot runs as an isolated, secure service.\n"
+        "• <b>Telegram:</b> Messages are transmitted via the official Telegram Bot API with content copy protection enabled.\n\n"
+        "<b>4. User Control & Data Deletion</b>\n"
+        "• <b>/logout:</b> Clears your saved ERP credentials and active sessions from MongoDB.\n"
+        "• <b>/lms_logout:</b> Completely purges your saved LMS credentials, tokens, and alert history from MongoDB.\n"
+        "• <b>Stopping/Blocking the Bot:</b> Automatically triggers an immediate and permanent purge of all your account data from the database."
     )
 
     await update.message.reply_text(privacy_text, parse_mode="HTML")
@@ -677,13 +1004,22 @@ async def description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     desc_text = (
-        "💡 <b>Why use this bot?</b>\n\n"
-        "• 📅 <b>Direct ERP Sync:</b>\n"
-        "Get your latest timetable directly from the ERP.\n\n"
-        "• ⚡ <b>Offline Access:</b>\n"
-        "In case of an emergency or when you don't have internet, you can simply open the timetable message already received in Telegram instead of going back to the ERP and logging in again.\n\n"
-        "• 🔄 <b>Live Updates:</b>\n"
-        "If you know there is a change in timetable, simply send the <code>/timetable</code> command again."
+        "<b>KL University Smart Assistant</b>\n\n"
+        "An all-in-one assistant for your ERP academic timetable, LMS assignments, and automated deadline tracking.\n\n"
+        "<b>Timetable & Schedule</b>\n"
+        "• <b>Live ERP Sync:</b> Fetch your real-time daily (/timetable) or full week (/week) class schedules with subject codes and room numbers.\n"
+        "• <b>Morning Dispatch:</b> Wake up to your daily schedule automatically delivered every morning at 7:00 AM IST (/morning).\n"
+        "• <b>Offline Access:</b> View previously synced schedules anytime, even during network issues or when university servers are slow.\n"
+        "• <b>Friend Timetable:</b> Check your classmate's schedule on the fly without logging out (/friend).\n\n"
+        "<b>LMS Submissions & Deadlines</b>\n"
+        "• <b>Submissions Tracker:</b> View all pending Home Assignments, ALMs, and Quizzes grouped neatly with due dates (/submissions).\n"
+        "• <b>Automated Reminders:</b> Receive background reminders 2 days (48h) and 6 hours before deadlines so you never miss a submission.\n"
+        "• <b>New Task Announcements:</b> Get notified instantly whenever a teacher posts a new assignment or quiz.\n"
+        "• <b>1-Tap Submissions:</b> Direct links on alerts take you straight to the submission page.\n\n"
+        "<b>Privacy & Security</b>\n"
+        "• <b>Fernet Encryption:</b> All credentials and session tokens (ERP and LMS) are encrypted using authenticated AES-128-CBC + HMAC-SHA256 before being stored in MongoDB.\n"
+        "• <b>Auto-Delete Passwords:</b> Plaintext passwords entered in chat are deleted instantly.\n"
+        "• <b>Full Control:</b> Disconnect and delete your data anytime with /logout and /lms_logout."
     )
 
     await update.message.reply_text(desc_text, parse_mode="HTML")
@@ -718,21 +1054,36 @@ async def _start_health_server(app: Application) -> None:
         port_num = int(port)
 
         async def handle_ping(reader, writer):
-            await reader.read(1024)
-            response = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"
-            writer.write(response)
-            await writer.drain()
-            writer.close()
-            await writer.wait_closed()
+            try:
+                await reader.read(1024)
+                response = (
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: text/plain\r\n"
+                    b"Content-Length: 2\r\n"
+                    b"Connection: close\r\n"
+                    b"\r\n"
+                    b"OK"
+                )
+                writer.write(response)
+                await writer.drain()
+            except Exception:
+                pass
+            finally:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
 
         server = await asyncio.start_server(handle_ping, "0.0.0.0", port_num)
+        app.bot_data["_health_server"] = server
         logger.info("Health check server active on port %s for Render/Cloud deployment", port_num)
     except Exception as exc:
         logger.warning("Could not start cloud health check server on port %s: %s", port, exc)
 
 
 async def _setup_bot_commands(app: Application) -> None:
-    """Register active Telegram commands."""
+    """Register active Telegram commands and profile descriptions."""
     try:
         if config.AUTHORIZED_TELEGRAM_USER_IDS:
             for uid in config.AUTHORIZED_TELEGRAM_USER_IDS:
@@ -749,6 +1100,27 @@ async def _setup_bot_commands(app: Application) -> None:
         logger.info("Registered %d active Telegram bot commands.", len(BOT_COMMANDS))
     except Exception as exc:
         logger.warning("Could not register bot commands with Telegram: %s", exc)
+
+    try:
+        bot_desc = (
+            "Your smart assistant for KL University ERP & LMS.\n\n"
+            "Features:\n"
+            "• Real-time ERP timetable (/timetable, /week)\n"
+            "• Daily 7:00 AM class schedule (/morning)\n"
+            "• LMS pending assignments & deadlines (/submissions)\n"
+            "• Automated deadline alerts (48h & 6h reminders)\n"
+            "• Instant new task announcements\n"
+            "• Friend timetable lookup (/friend)\n"
+            "• Authenticated Fernet encryption for credentials"
+        )
+        bot_short_desc = (
+            "Your all-in-one KL University assistant for ERP timetable, LMS submissions, deadlines & morning alerts."
+        )
+        await app.bot.set_my_description(bot_desc)
+        await app.bot.set_my_short_description(bot_short_desc)
+        logger.info("Updated Telegram bot descriptions successfully.")
+    except Exception as exc:
+        logger.warning("Could not set bot profile descriptions: %s", exc)
 
 
 async def _post_init(app: Application) -> None:
@@ -775,17 +1147,25 @@ def main() -> None:
     application.add_handler(CommandHandler("timetable", timetable))
     application.add_handler(CommandHandler("week", week))
     application.add_handler(CommandHandler("friend", friend))
+    application.add_handler(CommandHandler("submissions", submissions))
+    application.add_handler(CommandHandler("lms", submissions))
+    application.add_handler(CommandHandler("lms_login", lms_login))
+    application.add_handler(CommandHandler("lms_logout", lms_logout))
     application.add_handler(CommandHandler("morning", morning))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("description", description))
     application.add_handler(CommandHandler("describe", description))
     application.add_handler(CommandHandler("privacy", privacy))
     application.add_handler(CommandHandler("logout", logout))
+    application.add_handler(CallbackQueryHandler(handle_lms_callback, pattern=r"^lms:"))
     application.add_handler(ChatMemberHandler(handle_user_status_change, ChatMemberHandler.MY_CHAT_MEMBER))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_login_message))
 
     # Schedule the daily morning timetable job for all users with stored credentials.
     _schedule_morning_timetable_job(application)
+
+    # Schedule the periodic LMS deadline & new task alert job.
+    _schedule_lms_alerts_job(application)
 
     logger.info("KL University Timetable Bot v%s is starting...", BOT_VERSION)
     application.run_polling(allowed_updates=Update.ALL_TYPES)
