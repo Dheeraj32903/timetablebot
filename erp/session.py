@@ -110,6 +110,11 @@ async def perform_login(
             return {"cookies": cookies, "csrf_token": csrf_token}
         except Exception as exc:
             last_error = exc
+            err_str = str(exc).lower()
+            if "429" in err_str or "too many requests" in err_str:
+                logger.error("ERP rate limit (429) hit during login for user %s", user_id or "default")
+                raise RuntimeError("ERP server is temporarily rate-limiting requests (429 Too Many Requests). Please wait 2-3 minutes before trying /login again.")
+
             if attempt < retries:
                 # Never rush: space out attempts with 2s-4s gentle backoff & jitter
                 delay = 2.0 + (attempt * 0.75) + random.uniform(0.5, 1.5)

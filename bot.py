@@ -17,7 +17,9 @@ from telegram import (
 )
 from telegram.constants import ChatMemberStatus
 from telegram.ext import (
+    AIORateLimiter,
     Application,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     ChatMemberHandler,
     CommandHandler,
@@ -25,11 +27,13 @@ from telegram.ext import (
     Defaults,
     JobQueue,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
 import config
 import credentials
+import security
 import storage
 from erp.session import perform_login, fetch_timetable_html, load_session
 from erp.client import auto_login
@@ -41,6 +45,11 @@ from parser.timetable import (
 )
 from lms.client import LMSClient
 from lms.service import LMSService
+from outpass_ui import (
+    outpass_command,
+    handle_outpass_callback,
+    handle_outpass_text_reason,
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -90,6 +99,7 @@ BOT_COMMANDS = [
     BotCommand("week", "Full weekly timetable view"),
     BotCommand("friend", "Check your friend's timetable"),
     BotCommand("submissions", "Pending assignments & LMS deadlines"),
+    BotCommand("outpass", "Hostel outpass records & live status"),
     BotCommand("login", "Connect & save ERP credentials"),
     BotCommand("lms_login", "Connect & save LMS credentials"),
     BotCommand("lms_logout", "Disconnect LMS credentials"),
@@ -132,6 +142,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "📅 Check today's classes &amp; room numbers (<code>/timetable</code>)\n\n"
         "🗓️ View your full weekly timetable (<code>/week</code>)\n\n"
         "📋 <b>Track pending LMS HAs, ALMs &amp; deadlines</b> (<code>/submissions</code>)\n\n"
+        "🏠 <b>Check hostel outpass status &amp; apply for e-outing</b> (<code>/outpass</code>)\n\n"
         "⏰ Get daily morning schedule alerts (<code>/morning</code>)\n\n"
         "👥 Check your friends' schedules (<code>/friend</code>)\n\n"
         "👇 Tap the Menu button below ( or ) Type  /  to view commands"
@@ -146,50 +157,92 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _run_login(update: Update, username: str, password: str) -> None:
     """Run the async ERP login and report the result."""
-    await update.message.reply_text("⏳ Logging in to ERP...")
     user = update.effective_user
     uid = user.id if user else None
-    try:
-        await perform_login(username, password, user_id=uid)
 
-        # Save credentials for this Telegram user for future automatic use.
-        if uid:
-            credentials.save_user_credentials(uid, username, password)
+    if uid:
+        is_locked, remaining = security.brute_force_tracker.is_locked(uid)
+        if is_locked:
+            mins, secs = divmod(remaining, 60)
+            await update.message.reply_text(
+                f"🔒 <b>Login Temporarily Locked</b>\n\n"
+                f"Too many failed login attempts detected. To prevent university ERP account lockouts, "
+                f"please wait <b>{mins}m {secs}s</b> before trying again.",
+                parse_mode="HTML",
+            )
+            return
 
-        await update.message.reply_text(
-            "✅ <b>Logged in successfully.</b>\n"
-            "Send /timetable to get your timetable.",
-            parse_mode="HTML"
-        )
-    except Exception as exc:
-        logger.exception("Login failed")
-        await update.message.reply_text(
-            "❌ <b>Login failed.</b> Please check your credentials and try again.",
-            parse_mode="HTML"
-        )
+    async with security.user_concurrency.task_guard(uid) as acquired:
+        if not acquired:
+            await update.message.reply_text(
+                "⏳ <b>Request in progress.</b>\nYour previous request is still running. Please wait for it to finish.",
+                parse_mode="HTML",
+            )
+            return
+
+        await update.message.reply_text("⏳ Logging in to ERP...")
+        try:
+            await perform_login(username, password, user_id=uid)
+
+            # Save credentials for this Telegram user for future automatic use.
+            if uid:
+                security.brute_force_tracker.record_success(uid)
+                credentials.save_user_credentials(uid, username, password)
+
+            await update.message.reply_text(
+                "✅ <b>Logged in successfully.</b>\n"
+                "Send /timetable to get your timetable.",
+                parse_mode="HTML",
+            )
+        except Exception as exc:
+            logger.exception("Login failed")
+            if uid:
+                locked = security.brute_force_tracker.record_failure(uid)
+                if locked:
+                    await update.message.reply_text(
+                        "🔒 <b>Security Alert:</b> Too many failed login attempts.\n"
+                        "Login has been temporarily locked for 15 minutes to protect your student ERP account from being blocked by the university.",
+                        parse_mode="HTML",
+                    )
+                    return
+            await update.message.reply_text(
+                "❌ <b>Login failed.</b> Please check your credentials and try again.",
+                parse_mode="HTML",
+            )
 
 
 async def _run_friend_login(update: Update, username: str, password: str) -> None:
     """Log in with another user's credentials and send their timetable without saving them."""
-    await update.message.reply_text("⏳ Fetching friend's timetable...")
-    try:
-        # Perform ephemeral login without saving to user's persistent session
-        login_res = await auto_login(username, password)
-        cookies = login_res["cookies"]
-        csrf = login_res.get("csrf_token", "")
-        html = await fetch_timetable_html(cookies=cookies, csrf_token=csrf)
-        message = format_timetable_for_telegram(html, day=_today_day_name())
+    user = update.effective_user
+    uid = user.id if user else None
 
-        await update.message.reply_text(
-            message,
-            parse_mode="HTML",
-        )
-    except Exception as exc:
-        logger.exception("Friend login failed")
-        await update.message.reply_text(
-            "❌ <b>Could not fetch timetable.</b> Please check the credentials and try again.",
-            parse_mode="HTML"
-        )
+    async with security.user_concurrency.task_guard(uid) as acquired:
+        if not acquired:
+            await update.message.reply_text(
+                "⏳ <b>Request in progress.</b>\nPlease wait for your current request to complete.",
+                parse_mode="HTML",
+            )
+            return
+
+        await update.message.reply_text("⏳ Fetching friend's timetable...")
+        try:
+            # Perform ephemeral login without saving to user's persistent session
+            login_res = await auto_login(username, password)
+            cookies = login_res["cookies"]
+            csrf = login_res.get("csrf_token", "")
+            html = await fetch_timetable_html(cookies=cookies, csrf_token=csrf)
+            message = format_timetable_for_telegram(html, day=_today_day_name())
+
+            await update.message.reply_text(
+                message,
+                parse_mode="HTML",
+            )
+        except Exception as exc:
+            logger.exception("Friend login failed")
+            await update.message.reply_text(
+                "❌ <b>Could not fetch timetable.</b> Please check the credentials and try again.",
+                parse_mode="HTML",
+            )
 
 
 async def login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -199,6 +252,18 @@ async def login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     user = update.effective_user
     if not user:
+        return
+
+    # Check brute-force lockout status
+    is_locked, remaining = security.brute_force_tracker.is_locked(user.id)
+    if is_locked:
+        mins, secs = divmod(remaining, 60)
+        await update.message.reply_text(
+            f"🔒 <b>Login Temporarily Locked</b>\n\n"
+            f"Too many failed login attempts detected. To prevent university ERP account lockouts, "
+            f"please wait <b>{mins}m {secs}s</b> before trying again.",
+            parse_mode="HTML",
+        )
         return
 
     # Use stored credentials if available.
@@ -223,6 +288,20 @@ async def handle_login_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("⛔ You are not authorized to use this bot.")
         return
 
+    # Check if user is typing a custom outpass reason
+    if await handle_outpass_text_reason(update, context):
+        return
+
+    text = update.message.text.strip()
+
+    # Input length validation guard against buffer overflow / memory exhaustion
+    if not security.validate_input_length(text, max_length=security.MAX_INPUT_LENGTH):
+        await update.message.reply_text(
+            f"❌ <b>Input too long.</b> Maximum allowed length is {security.MAX_INPUT_LENGTH} characters.",
+            parse_mode="HTML",
+        )
+        return
+
     state = context.user_data.get("login_state")
     text = update.message.text.strip()
     is_friend_login = context.user_data.get("friend_login", False)
@@ -232,6 +311,7 @@ async def handle_login_message(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data.pop("friend_login", None)
         context.user_data.pop("erp_username", None)
         context.user_data.pop("lms_username", None)
+        context.user_data.pop("outpass_flow", None)
         await update.message.reply_text("❌ Action cancelled.")
         return
 
@@ -291,6 +371,10 @@ async def handle_login_message(update: Update, context: ContextTypes.DEFAULT_TYP
             return
 
         await _run_lms_login(update, context, username, password)
+        return
+
+    # --- Outpass Custom Reason Input ---
+    if await handle_outpass_text_reason(update, context):
         return
 
     # If we are not in a login conversation, ignore plain text.
@@ -415,25 +499,33 @@ async def submissions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not user:
         return
 
-    saved_lms = credentials.load_user_lms_credentials(user.id)
-    if not saved_lms:
-        # Submissions are strictly visible only if the user is logged into LMS
-        await update.message.reply_text(
-            "<b>LMS Not Connected</b>\n\n"
-            "Please connect your KL LMS account first using /lms_login to view your pending submissions and deadlines.",
-            parse_mode="HTML",
-        )
-        return
+    async with security.user_concurrency.task_guard(user.id) as acquired:
+        if not acquired:
+            await update.message.reply_text(
+                "⏳ <b>Request in progress.</b>\nYour previous request is still running. Please wait for it to finish.",
+                parse_mode="HTML",
+            )
+            return
 
-    # Check for warm in-memory cache for ultra-fast instant rendering
-    now = time.time()
-    cached = LMSService._task_cache.get(user.id)
-    if cached and (now - cached[0] < 120):
-        await _send_lms_pending_tasks(update, context, user.id, force_refresh=False)
-        return
+        saved_lms = credentials.load_user_lms_credentials(user.id)
+        if not saved_lms:
+            # Submissions are strictly visible only if the user is logged into LMS
+            await update.message.reply_text(
+                "<b>LMS Not Connected</b>\n\n"
+                "Please connect your KL LMS account first using /lms_login to view your pending submissions and deadlines.",
+                parse_mode="HTML",
+            )
+            return
 
-    status_msg = await update.message.reply_text("⏳ <b>Fetching your submissions from LMS...</b>", parse_mode="HTML")
-    await _send_lms_pending_tasks(update, context, user.id, message_to_edit=status_msg, force_refresh=False)
+        # Check for warm in-memory cache for ultra-fast instant rendering
+        now = time.time()
+        cached = LMSService._task_cache.get(user.id)
+        if cached and (now - cached[0] < 120):
+            await _send_lms_pending_tasks(update, context, user.id, force_refresh=False)
+            return
+
+        status_msg = await update.message.reply_text("⏳ <b>Fetching your submissions from LMS...</b>", parse_mode="HTML")
+        await _send_lms_pending_tasks(update, context, user.id, message_to_edit=status_msg, force_refresh=False)
 
 
 # Keep /lms as an alias to /submissions
@@ -627,40 +719,49 @@ async def timetable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    status_msg = await update.message.reply_text("⏳ Fetching your timetable...")
     user = update.effective_user
     uid = user.id if user else None
 
-    try:
-        try:
-            html = await fetch_timetable_html(user_id=uid)
-        except Exception:
-            # Silent re-auth fallback
-            saved = credentials.load_user_credentials(uid)
-            if saved:
-                await perform_login(saved["username"], saved["password"], user_id=uid)
-                html = await fetch_timetable_html(user_id=uid)
-            else:
-                raise
-
-        messages = get_timetable_messages(html, day_filter=day)
-        if not messages:
-            await status_msg.edit_text("⚠️ <i>Could not extract timetable. Please check in ERP.</i>", parse_mode="HTML")
+    async with security.user_concurrency.task_guard(uid) as acquired:
+        if not acquired:
+            await update.message.reply_text(
+                "⏳ <b>Request in progress.</b>\nYour previous request is still running. Please wait for it to finish.",
+                parse_mode="HTML",
+            )
             return
 
-        await status_msg.edit_text(
-            messages[0],
-            parse_mode="HTML",
-        )
-        for extra_msg in messages[1:]:
-            await update.message.reply_text(extra_msg, parse_mode="HTML")
-    except Exception as exc:
-        logger.exception("Failed to fetch timetable")
-        await status_msg.edit_text(
-            "⚠️ <b>Unable to fetch live timetable from ERP.</b>\n"
-            "Please check directly in the ERP portal or try again later.",
-            parse_mode="HTML",
-        )
+        status_msg = await update.message.reply_text("⏳ Fetching your timetable...")
+
+        try:
+            try:
+                html = await fetch_timetable_html(user_id=uid)
+            except Exception:
+                # Silent re-auth fallback
+                saved = credentials.load_user_credentials(uid)
+                if saved:
+                    await perform_login(saved["username"], saved["password"], user_id=uid)
+                    html = await fetch_timetable_html(user_id=uid)
+                else:
+                    raise
+
+            messages = get_timetable_messages(html, day_filter=day)
+            if not messages:
+                await status_msg.edit_text("⚠️ <i>Could not extract timetable. Please check in ERP.</i>", parse_mode="HTML")
+                return
+
+            await status_msg.edit_text(
+                messages[0],
+                parse_mode="HTML",
+            )
+            for extra_msg in messages[1:]:
+                await update.message.reply_text(extra_msg, parse_mode="HTML")
+        except Exception as exc:
+            logger.exception("Failed to fetch timetable")
+            await status_msg.edit_text(
+                "⚠️ <b>Unable to fetch live timetable from ERP.</b>\n"
+                "Please check directly in the ERP portal or try again later.",
+                parse_mode="HTML",
+            )
 
 
 async def week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -668,40 +769,49 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("⛔ You are not authorized to use this bot.")
         return
 
-    status_msg = await update.message.reply_text("⏳ Fetching your full week timetable...")
     user = update.effective_user
     uid = user.id if user else None
 
-    try:
-        try:
-            html = await fetch_timetable_html(user_id=uid)
-        except Exception:
-            # Silent re-auth fallback
-            saved = credentials.load_user_credentials(uid)
-            if saved:
-                await perform_login(saved["username"], saved["password"], user_id=uid)
-                html = await fetch_timetable_html(user_id=uid)
-            else:
-                raise
-
-        messages = get_timetable_messages(html)
-        if not messages:
-            await status_msg.edit_text("⚠️ <i>Could not extract timetable. Please check in ERP.</i>", parse_mode="HTML")
+    async with security.user_concurrency.task_guard(uid) as acquired:
+        if not acquired:
+            await update.message.reply_text(
+                "⏳ <b>Request in progress.</b>\nYour previous request is still running. Please wait for it to finish.",
+                parse_mode="HTML",
+            )
             return
 
-        await status_msg.edit_text(
-            messages[0],
-            parse_mode="HTML",
-        )
-        for extra_msg in messages[1:]:
-            await update.message.reply_text(extra_msg, parse_mode="HTML")
-    except Exception as exc:
-        logger.exception("Failed to fetch week timetable")
-        await status_msg.edit_text(
-            "⚠️ <b>Unable to fetch live timetable from ERP.</b>\n"
-            "Please check directly in the ERP portal or try again later.",
-            parse_mode="HTML",
-        )
+        status_msg = await update.message.reply_text("⏳ Fetching your full week timetable...")
+
+        try:
+            try:
+                html = await fetch_timetable_html(user_id=uid)
+            except Exception:
+                # Silent re-auth fallback
+                saved = credentials.load_user_credentials(uid)
+                if saved:
+                    await perform_login(saved["username"], saved["password"], user_id=uid)
+                    html = await fetch_timetable_html(user_id=uid)
+                else:
+                    raise
+
+            messages = get_timetable_messages(html)
+            if not messages:
+                await status_msg.edit_text("⚠️ <i>Could not extract timetable. Please check in ERP.</i>", parse_mode="HTML")
+                return
+
+            await status_msg.edit_text(
+                messages[0],
+                parse_mode="HTML",
+            )
+            for extra_msg in messages[1:]:
+                await update.message.reply_text(extra_msg, parse_mode="HTML")
+        except Exception as exc:
+            logger.exception("Failed to fetch week timetable")
+            await status_msg.edit_text(
+                "⚠️ <b>Unable to fetch live timetable from ERP.</b>\n"
+                "Please check directly in the ERP portal or try again later.",
+                parse_mode="HTML",
+            )
 
 
 
@@ -1055,7 +1165,8 @@ async def _start_health_server(app: Application) -> None:
 
         async def handle_ping(reader, writer):
             try:
-                await reader.read(1024)
+                # 3-second timeout prevents Slowloris socket exhaustion
+                await asyncio.wait_for(reader.read(1024), timeout=3.0)
                 response = (
                     b"HTTP/1.1 200 OK\r\n"
                     b"Content-Type: text/plain\r\n"
@@ -1110,6 +1221,7 @@ async def _setup_bot_commands(app: Application) -> None:
             "• LMS pending assignments & deadlines (/submissions)\n"
             "• Automated deadline alerts (48h & 6h reminders)\n"
             "• Instant new task announcements\n"
+            "• Hostel e-outing outpass tracking & apply (/outpass)\n"
             "• Friend timetable lookup (/friend)\n"
             "• Authenticated Fernet encryption for credentials"
         )
@@ -1136,11 +1248,15 @@ def main() -> None:
     application = (
         Application.builder()
         .token(config.TELEGRAM_BOT_TOKEN)
+        .rate_limiter(AIORateLimiter(max_retries=3))
         .defaults(Defaults(protect_content=True))
         .job_queue(JobQueue())
         .post_init(_post_init)
         .build()
     )
+
+    # Register Anti-Flood / Anti-DoS Middleware at group=-1 (executes before all handlers)
+    application.add_handler(TypeHandler(Update, security.anti_flood_middleware), group=-1)
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("login", login))
@@ -1149,6 +1265,7 @@ def main() -> None:
     application.add_handler(CommandHandler("friend", friend))
     application.add_handler(CommandHandler("submissions", submissions))
     application.add_handler(CommandHandler("lms", submissions))
+    application.add_handler(CommandHandler("outpass", outpass_command))
     application.add_handler(CommandHandler("lms_login", lms_login))
     application.add_handler(CommandHandler("lms_logout", lms_logout))
     application.add_handler(CommandHandler("morning", morning))
@@ -1158,6 +1275,7 @@ def main() -> None:
     application.add_handler(CommandHandler("privacy", privacy))
     application.add_handler(CommandHandler("logout", logout))
     application.add_handler(CallbackQueryHandler(handle_lms_callback, pattern=r"^lms:"))
+    application.add_handler(CallbackQueryHandler(handle_outpass_callback, pattern=r"^(outpass|outcal)"))
     application.add_handler(ChatMemberHandler(handle_user_status_change, ChatMemberHandler.MY_CHAT_MEMBER))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_login_message))
 
@@ -1166,6 +1284,18 @@ def main() -> None:
 
     # Schedule the periodic LMS deadline & new task alert job.
     _schedule_lms_alerts_job(application)
+
+    # Schedule memory cleanup for rate limiter inactive users every 5 minutes.
+    async def _cleanup_rate_limiter_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        security.rate_limiter.cleanup_inactive_users()
+
+    if application.job_queue:
+        application.job_queue.run_repeating(
+            _cleanup_rate_limiter_job,
+            interval=300,
+            first=300,
+            name="rate_limiter_cleanup",
+        )
 
     logger.info("KL University Timetable Bot v%s is starting...", BOT_VERSION)
     application.run_polling(allowed_updates=Update.ALL_TYPES)

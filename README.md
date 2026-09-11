@@ -23,7 +23,14 @@ Features local automated CAPTCHA solving with ONNX, 256-bit Fernet encrypted mul
 - 🆕 **New Task Alerts**: Automatically alerts you when a professor uploads a new assignment or quiz.
 - 🔗 **1-Tap Direct Links**: Inline buttons take you directly to the submission portal.
 
-### 🔒 Enterprise-Grade Security & Privacy
+### 🏠 Hostel Outpass & E-Outing
+- 📋 **Live Outpass Tracker & Wizard (`/outpass`)**: View active outpass status (`🟢 Approved`, `⏳ Pending`, `🔴 Rejected`), departure/return windows, and warden details.
+- ⏱️ **Local Outing (Hours) Application**: Interactive step-by-step wizard with inline Telegram calendar, 24-hour & 5-minute increment time pickers matching university ERP, mess meal toggles (`🍞`, `🍛`, `☕`, `🍽️`), manual custom reason entry, and explicit submission confirmation.
+- 🏡 **Home Outing (Days) Application**: Multi-day trip permission with departure & return date & time pickers, manual reason entry, and review summary card before applying.
+
+### 🔒 Enterprise-Grade Security & Anti-DoS Protection
+- 🛡️ **Anti-Flood & Anti-DoS Middleware**: Sliding-window rate limiting with burst, sustained, and UI callback thresholds, preventing spam attacks, click abuse, and university WAF blacklisting.
+- 🚦 **Concurrency Guards & Lockouts**: Per-user task debouncing prevents race conditions, duplicate submissions, and session corruption.
 - 🔐 **Authenticated Fernet Encryption**: All ERP and LMS student credentials, passwords, and Moodle API tokens are encrypted with Fernet (AES-128-CBC + HMAC-SHA256) before storing in MongoDB Atlas.
 - 🚫 **Zero Plaintext Storage**: Plaintext passwords are never saved to disk or database.
 - 🗑️ **Auto-Deleting Chat Secrets**: Password messages sent during login are instantly deleted from Telegram chat.
@@ -39,6 +46,9 @@ Features local automated CAPTCHA solving with ONNX, 256-bit Fernet encrypted mul
 ├── config.py             # Configuration & environment variable loader
 ├── credentials.py        # 256-bit Fernet encryption for ERP & LMS credentials and tokens
 ├── storage.py            # MongoDB Atlas database operations & user state management
+├── security.py           # Rate limiting, anti-flood middleware, concurrency guards & login brute-force tracking
+├── outpass_ui.py         # Hostel outpass UI wizard, review card, and manual reason handler
+├── calendar_ui.py        # Inline Telegram calendar and 24-hour / 5-minute time pickers
 ├── requirements.txt      # Python package dependencies
 ├── Dockerfile            # Production Docker image definition
 ├── docker-compose.yml    # Multi-container orchestration
@@ -48,6 +58,7 @@ Features local automated CAPTCHA solving with ONNX, 256-bit Fernet encrypted mul
 ├── erp/
 │   ├── client.py         # Asynchronous HTTP client for ERP login & timetable fetch
 │   ├── session.py        # ERP session & cookie management
+│   ├── outpass.py        # ERP outpass HTTP API, form submission & AJAX helpers
 │   └── captcha_solver.py # Local ONNX CRNN CAPTCHA solver
 ├── lms/
 │   ├── __init__.py       # Package exports
@@ -127,6 +138,7 @@ python bot.py
 | `/timetable <day>` | View timetable for a specific day (`today`, `tomorrow`, `mon`, etc.) |
 | `/week` | Full weekly timetable view |
 | `/submissions` | View pending assignments, ALMs, quizzes & LMS deadlines |
+| `/outpass` | View hostel outpass status & apply for e-outing |
 | `/friend` | Fetch another student's timetable without overriding your saved account |
 | `/login` | Connect & save ERP credentials (encrypted) |
 | `/lms_login` | Connect & save KL LMS credentials (encrypted) |

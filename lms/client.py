@@ -2,6 +2,7 @@ import logging
 from typing import Any, Optional
 import httpx
 from bs4 import BeautifulSoup
+from security import backend_throttle
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +54,8 @@ class LMSClient:
             "service": "moodle_mobile_app",
         }
         try:
-            resp = await client.post(TOKEN_ENDPOINT, data=payload)
+            async with backend_throttle.lms_semaphore:
+                resp = await client.post(TOKEN_ENDPOINT, data=payload)
             data = resp.json()
         except httpx.RequestError as exc:
             logger.error("Network error requesting LMS token: %s", exc)
@@ -92,7 +94,8 @@ class LMSClient:
 
         client = self.get_shared_client(timeout=self.timeout)
         try:
-            resp = await client.post(WS_ENDPOINT, params=query_params)
+            async with backend_throttle.lms_semaphore:
+                resp = await client.post(WS_ENDPOINT, params=query_params)
             data = resp.json()
         except httpx.RequestError as exc:
             logger.error("Network error executing WS %s: %s", wsfunction, exc)
