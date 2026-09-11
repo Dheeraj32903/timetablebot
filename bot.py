@@ -1245,15 +1245,20 @@ def main() -> None:
     if not config.TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set. Check your .env file.")
 
-    application = (
+    builder = (
         Application.builder()
         .token(config.TELEGRAM_BOT_TOKEN)
-        .rate_limiter(AIORateLimiter(max_retries=3))
         .defaults(Defaults(protect_content=True))
         .job_queue(JobQueue())
         .post_init(_post_init)
-        .build()
     )
+
+    try:
+        builder = builder.rate_limiter(AIORateLimiter(max_retries=3))
+    except Exception as exc:
+        logger.warning("AIORateLimiter optional package not loaded (%s); continuing with security anti-flood middleware.", exc)
+
+    application = builder.build()
 
     # Register Anti-Flood / Anti-DoS Middleware at group=-1 (executes before all handlers)
     application.add_handler(TypeHandler(Update, security.anti_flood_middleware), group=-1)
