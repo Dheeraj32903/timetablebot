@@ -258,8 +258,8 @@ class LMSService:
             c_name = clean_course_name(raw_c_name)
             for assign in ac.get("assignments", []):
                 duedate = assign.get("duedate", 0)
-                # Skip assignments closed more than 24 hours ago
-                if duedate > 0 and (time.time() - duedate > 86400):
+                # Skip assignments closed more than 12 hours ago or distant future (> 45 days)
+                if duedate > 0 and (now - duedate > 43200 or duedate - now > 45 * 86400):
                     continue
                 assign_candidates.append((assign, c_name))
 

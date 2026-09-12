@@ -24,7 +24,15 @@ def _load_model() -> None:
     with open(_CRNN_JSON_PATH, "r", encoding="utf-8") as f:
         _captcha_meta = json.load(f)
 
-    _captcha_session = ort.InferenceSession(_CRNN_ONNX_PATH)
+    opts = ort.SessionOptions()
+    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    opts.intra_op_num_threads = 2
+    _captcha_session = ort.InferenceSession(str(_CRNN_ONNX_PATH), sess_options=opts)
+
+
+def warmup_captcha_solver() -> None:
+    """Preload and warm up the ONNX inference session at startup to eliminate cold-start latency."""
+    _load_model()
 
 
 def solve_captcha(image_bytes: bytes) -> str:

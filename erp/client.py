@@ -153,84 +153,98 @@ async def _follow_redirects(
     return resp, current_cookies
 
 
+_erp_shared_client: Optional[httpx.AsyncClient] = None
+
+
+def get_erp_client(timeout: float = 30.0) -> httpx.AsyncClient:
+    """
+    Return a shared persistent AsyncClient with HTTP Keep-Alive connection pooling.
+    Eliminates repetitive TCP 3-way handshakes and TLS renegotiation delays.
+    """
+    global _erp_shared_client
+    if _erp_shared_client is None or _erp_shared_client.is_closed:
+        _erp_shared_client = httpx.AsyncClient(
+            verify=True,
+            timeout=timeout,
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=30, keepalive_expiry=60.0),
+            http2=False,
+            follow_redirects=False,
+        )
+    return _erp_shared_client
+
+
 async def auto_login(username: str, password: str) -> dict:
     """
-    Log in to the ERP automatically.
+    Log in to the ERP automatically using pooled HTTP connections.
     Returns a dict with cookies and the logged-in page response.
     """
     headers = _get_headers()
+    client = get_erp_client(timeout=30.0)
 
     async with backend_throttle.erp_semaphore:
-        async with httpx.AsyncClient(
-            verify=True,
-            headers=headers,
-            http2=False,
-            follow_redirects=False,
-            timeout=30.0,
-        ) as client:
-            # Step 1: GET login page to collect CSRF and initial cookies.
-            res, cookies = await _follow_redirects(client, "GET", LOGIN_URL, {}, timeout=30)
-            res.raise_for_status()
+        # Step 1: GET login page to collect CSRF and initial cookies.
+        res, cookies = await _follow_redirects(client, "GET", LOGIN_URL, {}, headers=headers, timeout=30)
+        res.raise_for_status()
 
-            csrf = _extract_csrf(res.text)
-            if not csrf:
-                raise RuntimeError("CSRF token not found on login page.")
+        csrf = _extract_csrf(res.text)
+        if not csrf:
+            raise RuntimeError("CSRF token not found on login page.")
 
-            # Step 2: Fetch and solve CAPTCHA directly using session cookies.
-            captcha_url = f"{BASE_URL}/index.php?r=site%2Fcaptcha&v={random.random()}"
-            captcha_headers = dict(headers)
-            captcha_headers["Referer"] = LOGIN_URL
-            captcha_headers["Sec-Fetch-Dest"] = "image"
-            captcha_headers["Sec-Fetch-Mode"] = "no-cors"
-            captcha_headers["Sec-Fetch-Site"] = "same-origin"
+        # Step 2: Fetch and solve CAPTCHA directly using session cookies.
+        captcha_url = f"{BASE_URL}/index.php?r=site%2Fcaptcha&v={random.random()}"
+        captcha_headers = dict(headers)
+        captcha_headers["Referer"] = LOGIN_URL
+        captcha_headers["Sec-Fetch-Dest"] = "image"
+        captcha_headers["Sec-Fetch-Mode"] = "no-cors"
+        captcha_headers["Sec-Fetch-Site"] = "same-origin"
 
-            captcha_res = await client.get(
-                captcha_url,
-                cookies=cookies,
-                headers=captcha_headers,
-                timeout=15,
-            )
-            captcha_res.raise_for_status()
-            cookies = _collect_cookies(captcha_res, cookies)
+        captcha_res = await client.get(
+            captcha_url,
+            cookies=cookies,
+            headers=captcha_headers,
+            timeout=15,
+        )
+        captcha_res.raise_for_status()
+        cookies = _collect_cookies(captcha_res, cookies)
 
-            captcha_bytes = captcha_res.content
-            captcha_code = solve_captcha(captcha_bytes)
+        captcha_bytes = captcha_res.content
+        captcha_code = solve_captcha(captcha_bytes)
 
-            # Step 4: Submit credentials + solved CAPTCHA.
-            submit_headers = dict(headers)
-            submit_headers["Content-Type"] = "application/x-www-form-urlencoded"
-            submit_headers["Referer"] = LOGIN_URL
-            submit_headers["Sec-Fetch-Site"] = "same-origin"
+        # Step 4: Submit credentials + solved CAPTCHA.
+        submit_headers = dict(headers)
+        submit_headers["Content-Type"] = "application/x-www-form-urlencoded"
+        submit_headers["Referer"] = LOGIN_URL
+        submit_headers["Sec-Fetch-Site"] = "same-origin"
 
-            payload = {
-                "_csrf": csrf,
-                "LoginForm[username]": username.strip(),
-                "LoginForm[password]": password,
-                "LoginForm[captcha]": captcha_code,
-                "LoginForm[verifyCode]": captcha_code,
-            }
+        payload = {
+            "_csrf": csrf,
+            "LoginForm[username]": username.strip(),
+            "LoginForm[password]": password,
+            "LoginForm[captcha]": captcha_code,
+            "LoginForm[verifyCode]": captcha_code,
+        }
 
-            await asyncio.sleep(random.uniform(0.1, 0.3))
+        await asyncio.sleep(random.uniform(0.05, 0.15))
 
-            response, final_cookies = await _follow_redirects(
-                client, "POST", LOGIN_URL, cookies, data=payload, headers=submit_headers, timeout=30
-            )
-            response.raise_for_status()
+        response, final_cookies = await _follow_redirects(
+            client, "POST", LOGIN_URL, cookies, data=payload, headers=submit_headers, timeout=30
+        )
+        response.raise_for_status()
 
-            if _is_login_failed(response):
-                if "incorrect" in response.text.lower() or "invalid" in response.text.lower():
-                    raise RuntimeError(
-                        "ERP rejected the login. Check username, password, or CAPTCHA."
-                    )
-                raise RuntimeError("ERP login failed (returned login page).")
+        if _is_login_failed(response):
+            if "incorrect" in response.text.lower() or "invalid" in response.text.lower():
+                raise RuntimeError(
+                    "ERP rejected the login. Check username, password, or CAPTCHA."
+                )
+            raise RuntimeError("ERP login failed (returned login page).")
 
-            final_csrf = _extract_csrf(response.text) or csrf
+        final_csrf = _extract_csrf(response.text) or csrf
 
-            return {
-                "cookies": final_cookies,
-                "csrf_token": final_csrf,
-                "response": response,
-            }
+        return {
+            "cookies": final_cookies,
+            "csrf_token": final_csrf,
+            "response": response,
+        }
 
 
 async def fetch_timetable(
@@ -240,7 +254,7 @@ async def fetch_timetable(
     semester_id: str = "1",
 ) -> str:
     """
-    Fetch the timetable HTML using the authenticated session.
+    Fetch the timetable HTML using the authenticated session over persistent HTTP pool.
     """
     headers = _get_headers()
     headers["Referer"] = (
@@ -254,18 +268,12 @@ async def fetch_timetable(
         f"&UniversityMasterAcademicTimetableView%5Bsemesterid%5D={semester_id}"
     )
 
+    client = get_erp_client(timeout=35.0)
     async with backend_throttle.erp_semaphore:
-        async with httpx.AsyncClient(
-            verify=True,
-            headers=headers,
-            http2=False,
-            follow_redirects=True,
-            timeout=35.0,
-        ) as client:
-            response = await client.get(tt_url, cookies=cookies, timeout=35.0)
-            response.raise_for_status()
+        response = await client.get(tt_url, cookies=cookies, headers=headers, follow_redirects=True, timeout=35.0)
+        response.raise_for_status()
 
-            if _is_login_failed(response):
-                raise RuntimeError("ERP session expired or login required.")
+        if _is_login_failed(response):
+            raise RuntimeError("ERP session expired or login required.")
 
-            return response.text
+        return response.text

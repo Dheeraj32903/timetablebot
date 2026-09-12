@@ -48,15 +48,31 @@ def is_mongodb_active() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# In-Memory High-Speed Caches (Sub-millisecond access for active operations)
+# ---------------------------------------------------------------------------
+_credentials_cache: dict[int, dict] = {}
+_session_cache: dict[int, dict] = {}
+_morning_status_cache: dict[int, bool] = {}
+_timetable_cache: dict[int, str] = {}
+_lms_creds_cache: dict[int, dict] = {}
+_lms_token_cache: dict[int, str] = {}
+
+
+# ---------------------------------------------------------------------------
 # Credentials Storage Operations
 # ---------------------------------------------------------------------------
 
 def save_user_credentials(user_id: int, username_encrypted: str, password_encrypted: str) -> None:
-    """Save encrypted credentials for a user in MongoDB."""
+    """Save encrypted credentials for a user in MongoDB and update in-memory cache."""
+    uid = int(user_id)
+    _credentials_cache[uid] = {
+        "username": username_encrypted,
+        "password": password_encrypted,
+    }
     now_iso = datetime.now(timezone.utc).isoformat()
     try:
         _mongo_db.users.update_one(
-            {"_id": int(user_id)},
+            {"_id": uid},
             {
                 "$set": {
                     "username": username_encrypted,
@@ -77,24 +93,32 @@ def save_user_credentials(user_id: int, username_encrypted: str, password_encryp
 
 
 def load_user_credentials(user_id: int) -> Optional[dict]:
-    """Load encrypted credentials record for a specific user from MongoDB."""
+    """Load encrypted credentials record for a specific user with fast in-memory cache lookup."""
+    uid = int(user_id)
+    if uid in _credentials_cache:
+        return dict(_credentials_cache[uid])
+
     try:
-        doc = _mongo_db.users.find_one({"_id": int(user_id)})
+        doc = _mongo_db.users.find_one({"_id": uid})
         if doc and doc.get("username") and doc.get("password"):
-            return {
+            creds = {
                 "username": doc["username"],
                 "password": doc["password"],
             }
+            _credentials_cache[uid] = creds
+            return dict(creds)
     except Exception as exc:
         logger.error("Error loading credentials from MongoDB: %s", exc)
     return None
 
 
 def delete_user_credentials(user_id: int) -> None:
-    """Delete a user's stored credentials in MongoDB."""
+    """Delete a user's stored credentials in MongoDB and memory cache."""
+    uid = int(user_id)
+    _credentials_cache.pop(uid, None)
     try:
         _mongo_db.users.update_one(
-            {"_id": int(user_id)},
+            {"_id": uid},
             {"$unset": {"username": "", "password": ""}},
         )
     except Exception as exc:
@@ -108,11 +132,13 @@ def get_all_users() -> dict[str, dict]:
     try:
         cursor = _mongo_db.users.find({"username": {"$exists": True, "$ne": ""}})
         for doc in cursor:
-            uid = str(doc["_id"])
-            users_dict[uid] = {
+            uid_str = str(doc["_id"])
+            creds = {
                 "username": doc.get("username", ""),
                 "password": doc.get("password", ""),
             }
+            users_dict[uid_str] = creds
+            _credentials_cache[int(doc["_id"])] = creds
     except Exception as exc:
         logger.error("Error fetching all users from MongoDB: %s", exc)
     return users_dict
@@ -123,15 +149,18 @@ def get_all_users() -> dict[str, dict]:
 # ---------------------------------------------------------------------------
 
 def save_user_session(user_id: int, cookies: dict, csrf_token: Optional[str] = None) -> None:
-    """Save active ERP cookies and CSRF token for a specific Telegram user in MongoDB."""
+    """Save active ERP cookies and CSRF token for a specific Telegram user in MongoDB & memory cache."""
+    uid = int(user_id)
     session_data = {
         "cookies": cookies,
         "csrf_token": csrf_token,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
+    _session_cache[uid] = session_data
+
     try:
         _mongo_db.users.update_one(
-            {"_id": int(user_id)},
+            {"_id": uid},
             {"$set": {"session": session_data}},
             upsert=True,
         )
@@ -141,21 +170,29 @@ def save_user_session(user_id: int, cookies: dict, csrf_token: Optional[str] = N
 
 
 def load_user_session(user_id: int) -> Optional[dict]:
-    """Load active ERP session (cookies and csrf_token) for a user from MongoDB."""
+    """Load active ERP session (cookies and csrf_token) for a user with instant memory cache."""
+    uid = int(user_id)
+    if uid in _session_cache:
+        return dict(_session_cache[uid])
+
     try:
-        doc = _mongo_db.users.find_one({"_id": int(user_id)})
+        doc = _mongo_db.users.find_one({"_id": uid})
         if doc and doc.get("session"):
-            return doc["session"]
+            sess = doc["session"]
+            _session_cache[uid] = sess
+            return dict(sess)
     except Exception as exc:
         logger.error("Error loading session from MongoDB: %s", exc)
     return None
 
 
 def delete_user_session(user_id: int) -> None:
-    """Clear session cookies for a user in MongoDB."""
+    """Clear session cookies for a user in MongoDB and memory cache."""
+    uid = int(user_id)
+    _session_cache.pop(uid, None)
     try:
         _mongo_db.users.update_one(
-            {"_id": int(user_id)},
+            {"_id": uid},
             {"$unset": {"session": ""}},
         )
     except Exception as exc:
@@ -168,21 +205,29 @@ def delete_user_session(user_id: int) -> None:
 # ---------------------------------------------------------------------------
 
 def is_user_morning_enabled(user_id: int) -> bool:
-    """Check if morning alert is enabled for a specific user in MongoDB."""
+    """Check if morning alert is enabled for a specific user with fast cache lookup."""
+    uid = int(user_id)
+    if uid in _morning_status_cache:
+        return _morning_status_cache[uid]
+
     try:
-        doc = _mongo_db.users.find_one({"_id": int(user_id)})
+        doc = _mongo_db.users.find_one({"_id": uid})
         if doc and "morning_enabled" in doc:
-            return bool(doc["morning_enabled"])
+            status = bool(doc["morning_enabled"])
+            _morning_status_cache[uid] = status
+            return status
     except Exception as exc:
         logger.error("Error reading morning setting from MongoDB: %s", exc)
     return False
 
 
 def set_user_morning_enabled(user_id: int, enabled: bool) -> None:
-    """Toggle morning alert for a specific user in MongoDB."""
+    """Toggle morning alert for a specific user in MongoDB and memory cache."""
+    uid = int(user_id)
+    _morning_status_cache[uid] = bool(enabled)
     try:
         _mongo_db.users.update_one(
-            {"_id": int(user_id)},
+            {"_id": uid},
             {"$set": {"morning_enabled": bool(enabled)}},
             upsert=True,
         )
@@ -197,18 +242,22 @@ def get_all_morning_users() -> list[int]:
     try:
         cursor = _mongo_db.users.find({"morning_enabled": True})
         for doc in cursor:
-            user_ids.append(int(doc["_id"]))
+            uid = int(doc["_id"])
+            user_ids.append(uid)
+            _morning_status_cache[uid] = True
     except Exception as exc:
         logger.error("Error fetching morning users from MongoDB: %s", exc)
     return user_ids
 
 
 def save_user_timetable(user_id: int, timetable_html: str) -> None:
-    """Save the latest fetched timetable HTML for a user to MongoDB for offline fallback."""
+    """Save the latest fetched timetable HTML for a user to memory cache and MongoDB for offline fallback."""
+    uid = int(user_id)
+    _timetable_cache[uid] = timetable_html
     now_iso = datetime.now(timezone.utc).isoformat()
     try:
         _mongo_db.users.update_one(
-            {"_id": int(user_id)},
+            {"_id": uid},
             {
                 "$set": {
                     "cached_timetable": {
@@ -224,20 +273,35 @@ def save_user_timetable(user_id: int, timetable_html: str) -> None:
 
 
 def load_user_timetable(user_id: int) -> Optional[str]:
-    """Load the latest cached timetable HTML for a user from MongoDB."""
+    """Load the latest cached timetable HTML for a user from memory cache or MongoDB."""
+    uid = int(user_id)
+    if uid in _timetable_cache:
+        return _timetable_cache[uid]
+
     try:
-        doc = _mongo_db.users.find_one({"_id": int(user_id)})
+        doc = _mongo_db.users.find_one({"_id": uid})
         if doc and doc.get("cached_timetable"):
-            return doc["cached_timetable"].get("html")
+            html = doc["cached_timetable"].get("html")
+            if html:
+                _timetable_cache[uid] = html
+                return html
     except Exception as exc:
         logger.error("Error loading cached timetable from MongoDB: %s", exc)
     return None
 
 
 def delete_user_all_data(user_id: int) -> bool:
-    """Completely remove all stored user data (credentials, session, morning settings, timetable, LMS) from MongoDB."""
+    """Completely remove all stored user data (credentials, session, morning settings, timetable, LMS) from memory and MongoDB."""
+    uid = int(user_id)
+    _credentials_cache.pop(uid, None)
+    _session_cache.pop(uid, None)
+    _morning_status_cache.pop(uid, None)
+    _timetable_cache.pop(uid, None)
+    _lms_creds_cache.pop(uid, None)
+    _lms_token_cache.pop(uid, None)
+
     try:
-        res = _mongo_db.users.delete_one({"_id": int(user_id)})
+        res = _mongo_db.users.delete_one({"_id": uid})
         return res.deleted_count > 0
     except Exception as exc:
         logger.error("Error completely deleting user from MongoDB: %s", exc)
@@ -249,11 +313,16 @@ def delete_user_all_data(user_id: int) -> bool:
 # ---------------------------------------------------------------------------
 
 def save_user_lms_credentials(user_id: int, username_encrypted: str, password_encrypted: str) -> None:
-    """Save encrypted LMS credentials for a user in MongoDB."""
+    """Save encrypted LMS credentials for a user in MongoDB and memory cache."""
+    uid = int(user_id)
+    _lms_creds_cache[uid] = {
+        "username": username_encrypted,
+        "password": password_encrypted,
+    }
     now_iso = datetime.now(timezone.utc).isoformat()
     try:
         _mongo_db.users.update_one(
-            {"_id": int(user_id)},
+            {"_id": uid},
             {
                 "$set": {
                     "lms_username": username_encrypted,
@@ -272,24 +341,33 @@ def save_user_lms_credentials(user_id: int, username_encrypted: str, password_en
 
 
 def load_user_lms_credentials(user_id: int) -> Optional[dict]:
-    """Load encrypted LMS credentials record for a specific user from MongoDB."""
+    """Load encrypted LMS credentials record for a specific user with fast cache lookup."""
+    uid = int(user_id)
+    if uid in _lms_creds_cache:
+        return dict(_lms_creds_cache[uid])
+
     try:
-        doc = _mongo_db.users.find_one({"_id": int(user_id)})
+        doc = _mongo_db.users.find_one({"_id": uid})
         if doc and doc.get("lms_username") and doc.get("lms_password"):
-            return {
+            creds = {
                 "username": doc["lms_username"],
                 "password": doc["lms_password"],
             }
+            _lms_creds_cache[uid] = creds
+            return dict(creds)
     except Exception as exc:
         logger.error("Error loading LMS credentials from MongoDB: %s", exc)
     return None
 
 
 def delete_user_lms_credentials(user_id: int) -> None:
-    """Delete a user's stored LMS credentials, token, and task state in MongoDB."""
+    """Delete a user's stored LMS credentials, token, and task state in MongoDB and memory cache."""
+    uid = int(user_id)
+    _lms_creds_cache.pop(uid, None)
+    _lms_token_cache.pop(uid, None)
     try:
         _mongo_db.users.update_one(
-            {"_id": int(user_id)},
+            {"_id": uid},
             {"$unset": {"lms_username": "", "lms_password": "", "lms_token": "", "lms_tasks": ""}},
         )
     except Exception as exc:
@@ -298,11 +376,13 @@ def delete_user_lms_credentials(user_id: int) -> None:
 
 
 def save_user_lms_token(user_id: int, token: str) -> None:
-    """Cache Moodle REST API token for a user in MongoDB."""
+    """Cache Moodle REST API token for a user in MongoDB and memory cache."""
+    uid = int(user_id)
+    _lms_token_cache[uid] = token
     now_iso = datetime.now(timezone.utc).isoformat()
     try:
         _mongo_db.users.update_one(
-            {"_id": int(user_id)},
+            {"_id": uid},
             {
                 "$set": {
                     "lms_token": token,
@@ -316,11 +396,17 @@ def save_user_lms_token(user_id: int, token: str) -> None:
 
 
 def load_user_lms_token(user_id: int) -> Optional[str]:
-    """Load cached Moodle REST API token for a user from MongoDB."""
+    """Load cached Moodle REST API token for a user from memory cache or MongoDB."""
+    uid = int(user_id)
+    if uid in _lms_token_cache:
+        return _lms_token_cache[uid]
+
     try:
-        doc = _mongo_db.users.find_one({"_id": int(user_id)})
+        doc = _mongo_db.users.find_one({"_id": uid})
         if doc and doc.get("lms_token"):
-            return doc["lms_token"]
+            token = doc["lms_token"]
+            _lms_token_cache[uid] = token
+            return token
     except Exception as exc:
         logger.error("Error loading LMS token from MongoDB: %s", exc)
     return None

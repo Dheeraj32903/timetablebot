@@ -7,7 +7,7 @@ import httpx
 
 import config
 from credentials import load_user_credentials
-from erp.client import _get_headers
+from erp.client import _get_headers, get_erp_client
 from erp.session import _cookies_for_request, load_session, perform_login
 from security import backend_throttle
 
@@ -19,27 +19,28 @@ URL_APPLY_HOME = f"{config.ERP_BASE_URL}/index.php?r=hostel%2Fhostel-student-out
 URL_GET_INTIME_JAX = f"{config.ERP_BASE_URL}/index.php?r=hostel%2Fhostel-student-outpass-requests-info%2Fget_intime_jax"
 
 
-async def _get_authenticated_client(user_id: Optional[int] = None) -> Tuple[httpx.AsyncClient, dict, str]:
+async def _get_authenticated_client(user_id: Optional[int] = None) -> Tuple[httpx.AsyncClient, dict, str, Optional[str]]:
     """
-    Ensure active session exists and return (client, cookies, csrf_token).
-    Automatically logs in using user credentials if expired.
+    Ensure active session exists and return (client, cookies, csrf_token, preloaded_html).
+    Uses pooled persistent connections and reuses the liveness verification response
+    to eliminate duplicate network requests.
     """
     sess = load_session(user_id=user_id)
     cookies = sess.get("cookies", {}) if sess else {}
     csrf_token = sess.get("csrf_token", "") if sess else ""
 
     headers = _get_headers()
-    client = httpx.AsyncClient(verify=False, timeout=30, follow_redirects=True, headers=headers)
+    client = get_erp_client(timeout=30.0)
 
     req_cookies = _cookies_for_request(cookies) if cookies else {}
+    preloaded_html: Optional[str] = None
 
-    # Verify session liveness with a lightweight check
-    test_resp = await client.get(URL_OUTPASS_LIST, cookies=req_cookies)
+    # Verify session liveness with outpass list check
+    test_resp = await client.get(URL_OUTPASS_LIST, cookies=req_cookies, headers=headers, follow_redirects=True)
     if "site%2Flogin" in str(test_resp.url) or "site/login" in str(test_resp.url) or "LoginForm" in test_resp.text:
         logger.info("Session expired, performing re-login for outpass module...")
         creds = load_user_credentials(user_id) if user_id else None
         if not creds or not creds.get("username") or not creds.get("password"):
-            await client.aclose()
             raise RuntimeError("No active ERP session or stored credentials. Please log in with /login first.")
 
         login_res = await perform_login(creds["username"], creds["password"], user_id=user_id)
@@ -47,50 +48,58 @@ async def _get_authenticated_client(user_id: Optional[int] = None) -> Tuple[http
         csrf_token = login_res["csrf_token"]
         req_cookies = _cookies_for_request(cookies)
 
-    return client, req_cookies, csrf_token
+        # Fetch outpass list once with the newly authenticated session
+        fresh_resp = await client.get(URL_OUTPASS_LIST, cookies=req_cookies, headers=headers, follow_redirects=True)
+        preloaded_html = fresh_resp.text
+    else:
+        # Re-use the already fetched HTML directly — zero extra network round-trip!
+        preloaded_html = test_resp.text
+
+    return client, req_cookies, csrf_token, preloaded_html
 
 
 async def fetch_outpass_history(user_id: Optional[int] = None) -> List[Dict]:
     """
     Fetch the latest / active outpass request and return structured data list.
+    Fast path uses the preloaded HTML from the authentication check.
     """
     async with backend_throttle.erp_semaphore:
-        client, req_cookies, _ = await _get_authenticated_client(user_id)
-        try:
-            resp = await client.get(URL_OUTPASS_LIST, cookies=req_cookies)
+        client, req_cookies, _, html = await _get_authenticated_client(user_id)
+        if not html:
+            headers = _get_headers()
+            resp = await client.get(URL_OUTPASS_LIST, cookies=req_cookies, headers=headers, follow_redirects=True)
             resp.raise_for_status()
+            html = resp.text
 
-            soup = BeautifulSoup(resp.text, "html.parser")
-            table = soup.find("table")
-            if not table:
-                return []
+        soup = BeautifulSoup(html, "html.parser")
+        table = soup.find("table")
+        if not table:
+            return []
 
-            outpasses = []
-            rows = table.find_all("tr")
-            for row in rows:
-                cols = [td.text.strip() for td in row.find_all("td")]
-                if len(cols) >= 12 and cols[1].isdigit():
-                    view_a = row.find("a", title="View")
-                    view_link = view_a.get("href") if view_a else ""
+        outpasses = []
+        rows = table.find_all("tr")
+        for row in rows:
+            cols = [td.text.strip() for td in row.find_all("td")]
+            if len(cols) >= 12 and cols[1].isdigit():
+                view_a = row.find("a", title="View")
+                view_link = view_a.get("href") if view_a else ""
 
-                    outpasses.append({
-                        "id": cols[1],
-                        "student_id": cols[2],
-                        "outing_date": cols[3],
-                        "out_time": cols[4],
-                        "in_time": cols[5],
-                        "reason": cols[6],
-                        "warden_name": cols[9],
-                        "status": cols[10] or "Pending",
-                        "approved_by": cols[11] or "N/A",
-                        "cancellation_status": cols[12] if len(cols) > 12 else "",
-                        "view_url": f"{config.ERP_BASE_URL}{view_link}" if view_link.startswith("/") else view_link,
-                    })
-                    break  # Focus strictly on the latest / active outpass
+                outpasses.append({
+                    "id": cols[1],
+                    "student_id": cols[2],
+                    "outing_date": cols[3],
+                    "out_time": cols[4],
+                    "in_time": cols[5],
+                    "reason": cols[6],
+                    "warden_name": cols[9],
+                    "status": cols[10] or "Pending",
+                    "approved_by": cols[11] or "N/A",
+                    "cancellation_status": cols[12] if len(cols) > 12 else "",
+                    "view_url": f"{config.ERP_BASE_URL}{view_link}" if view_link.startswith("/") else view_link,
+                })
+                break  # Focus strictly on the latest / active outpass
 
-            return outpasses
-        finally:
-            await client.aclose()
+        return outpasses
 
 
 async def get_available_in_times(out_time: str, user_id: Optional[int] = None) -> List[str]:
@@ -98,11 +107,12 @@ async def get_available_in_times(out_time: str, user_id: Optional[int] = None) -
     Call ERP AJAX endpoint to get allowed In-Times for a given Out-Time.
     Example out_time: '17:00:00' -> returns ['17:30:00', '18:00:00', ...]
     """
+    headers = _get_headers()
     async with backend_throttle.erp_semaphore:
-        client, req_cookies, _ = await _get_authenticated_client(user_id)
+        client, req_cookies, _, _ = await _get_authenticated_client(user_id)
         try:
             # 1. Fetch form to get fresh CSRF and ensure cookies are synchronized
-            form_resp = await client.get(URL_APPLY_LOCAL, cookies=req_cookies)
+            form_resp = await client.get(URL_APPLY_LOCAL, cookies=req_cookies, headers=headers, follow_redirects=True)
             soup = BeautifulSoup(form_resp.text, "html.parser")
             csrf_input = soup.find("input", {"name": "_csrf"})
             fresh_csrf = csrf_input["value"] if csrf_input else ""
@@ -110,13 +120,14 @@ async def get_available_in_times(out_time: str, user_id: Optional[int] = None) -
             for k, v in form_resp.cookies.items():
                 req_cookies[k] = v
 
-            ajax_headers = {
+            ajax_headers = dict(headers)
+            ajax_headers.update({
                 "Accept": "application/json, text/javascript, */*; q=0.01",
                 "X-Requested-With": "XMLHttpRequest",
                 "Origin": config.ERP_BASE_URL,
                 "Referer": URL_APPLY_LOCAL,
                 "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            }
+            })
 
             payload = {
                 "_csrf": fresh_csrf,
@@ -143,8 +154,6 @@ async def get_available_in_times(out_time: str, user_id: Optional[int] = None) -
                 return slots
             except Exception:
                 return ["18:00:00", "18:30:00", "19:00:00", "19:30:00", "20:00:00", "20:30:00", "21:00:00", "21:30:00", "22:00:00"]
-        finally:
-            await client.aclose()
 
 
 async def submit_local_outpass(
@@ -166,11 +175,12 @@ async def submit_local_outpass(
     if meals is None:
         meals = {"breakfast": "NO", "lunch": "NO", "snack": "NO", "dinner": "NO"}
 
+    headers = _get_headers()
     async with backend_throttle.erp_semaphore:
-        client, req_cookies, _ = await _get_authenticated_client(user_id)
+        client, req_cookies, _, _ = await _get_authenticated_client(user_id)
         try:
             # Step 1: GET form page to extract dynamic profile ID and fresh CSRF
-            form_resp = await client.get(URL_APPLY_LOCAL, cookies=req_cookies)
+            form_resp = await client.get(URL_APPLY_LOCAL, cookies=req_cookies, headers=headers, follow_redirects=True)
             soup = BeautifulSoup(form_resp.text, "html.parser")
 
             csrf_input = soup.find("input", {"name": "_csrf"})
@@ -188,11 +198,12 @@ async def submit_local_outpass(
                 req_cookies[k] = v
 
             # Step 2: POST form data
-            post_headers = {
+            post_headers = dict(headers)
+            post_headers.update({
                 "Origin": config.ERP_BASE_URL,
                 "Referer": URL_APPLY_LOCAL,
                 "Content-Type": "application/x-www-form-urlencoded",
-            }
+            })
 
             payload = {
                 "_csrf": csrf_token,
@@ -221,8 +232,6 @@ async def submit_local_outpass(
         except Exception as e:
             logger.error("Failed to submit local outpass: %s", e)
             return False, str(e)
-        finally:
-            await client.aclose()
 
 
 async def submit_home_outpass(
@@ -237,11 +246,12 @@ async def submit_home_outpass(
     in_datetime: 'YYYY-MM-DD HH:MM:SS' (e.g. '2026-09-15 18:00:00')
     reason: reason string
     """
+    headers = _get_headers()
     async with backend_throttle.erp_semaphore:
-        client, req_cookies, _ = await _get_authenticated_client(user_id)
+        client, req_cookies, _, _ = await _get_authenticated_client(user_id)
         try:
             # Step 1: GET form page
-            form_resp = await client.get(URL_APPLY_HOME, cookies=req_cookies)
+            form_resp = await client.get(URL_APPLY_HOME, cookies=req_cookies, headers=headers, follow_redirects=True)
             soup = BeautifulSoup(form_resp.text, "html.parser")
 
             csrf_input = soup.find("input", {"name": "_csrf"})
@@ -258,11 +268,12 @@ async def submit_home_outpass(
             for k, v in form_resp.cookies.items():
                 req_cookies[k] = v
 
-            post_headers = {
+            post_headers = dict(headers)
+            post_headers.update({
                 "Origin": config.ERP_BASE_URL,
                 "Referer": URL_APPLY_HOME,
                 "Content-Type": "application/x-www-form-urlencoded",
-            }
+            })
 
             payload = {
                 "_csrf": csrf_token,
@@ -285,5 +296,3 @@ async def submit_home_outpass(
         except Exception as e:
             logger.error("Failed to submit home outpass: %s", e)
             return False, str(e)
-        finally:
-            await client.aclose()

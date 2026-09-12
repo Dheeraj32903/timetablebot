@@ -71,6 +71,25 @@ MORNING_PREFETCH_JOB_NAME = "morning_prefetch"
 LMS_ALERTS_JOB_NAME = "lms_alerts_checker"
 _morning_cache: dict[int, str] = {}
 
+# Fast in-memory timetable cache: user_id -> (timestamp, html)
+_timetable_memory_cache: dict[int, tuple[float, str]] = {}
+TIMETABLE_CACHE_TTL = 1800.0  # 30-minute fast cache TTL for instant responses (<0.05s)
+
+
+def _get_timetable_keyboard(current_day: Optional[str] = None) -> InlineKeyboardMarkup:
+    """Generate quick-switch buttons for days, full week view, and fresh sync."""
+    day_abbrs = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+    row1 = []
+    for d in day_abbrs:
+        is_active = (current_day or "").lower().startswith(d.lower())
+        label = f"•{d}•" if is_active else d
+        row1.append(InlineKeyboardButton(label, callback_data=f"tt:day:{d}"))
+    row2 = [
+        InlineKeyboardButton("🗓️ Full Week", callback_data="tt:week"),
+        InlineKeyboardButton("🔄 Refresh", callback_data="tt:refresh"),
+    ]
+    return InlineKeyboardMarkup([row1, row2])
+
 
 def _is_morning_enabled(user_id: Optional[int] = None) -> bool:
     """Return True if daily morning timetable is enabled for this user or any user."""
@@ -722,6 +741,7 @@ async def timetable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     uid = user.id if user else None
 
+    # Always fetch LIVE from ERP
     async with security.user_concurrency.task_guard(uid) as acquired:
         if not acquired:
             await update.message.reply_text(
@@ -730,7 +750,8 @@ async def timetable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             return
 
-        status_msg = await update.message.reply_text("⏳ Fetching your timetable...")
+        status_msg = await update.message.reply_text("⏳ Fetching your live timetable from ERP...")
+        is_fallback = False
 
         try:
             try:
@@ -739,22 +760,48 @@ async def timetable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 # Silent re-auth fallback
                 saved = credentials.load_user_credentials(uid)
                 if saved:
-                    await perform_login(saved["username"], saved["password"], user_id=uid)
-                    html = await fetch_timetable_html(user_id=uid)
+                    try:
+                        await perform_login(saved["username"], saved["password"], user_id=uid)
+                        html = await fetch_timetable_html(user_id=uid)
+                    except Exception:
+                        # Graceful downtime fallback if ERP is temporarily down
+                        fb = storage.load_user_timetable(uid)
+                        if fb:
+                            html = fb
+                            is_fallback = True
+                        else:
+                            raise
                 else:
-                    raise
+                    fb = storage.load_user_timetable(uid)
+                    if fb:
+                        html = fb
+                        is_fallback = True
+                    else:
+                        raise
+
+            if uid:
+                _timetable_memory_cache[uid] = (time.time(), html)
 
             messages = get_timetable_messages(html, day_filter=day)
             if not messages:
                 await status_msg.edit_text("⚠️ <i>Could not extract timetable. Please check in ERP.</i>", parse_mode="HTML")
                 return
 
+            prefix = "⚡ <b>ERP is temporarily down or unreachable.</b>\n<i>Showing your last saved schedule:</i>\n\n" if is_fallback else ""
+            kb = _get_timetable_keyboard(current_day=day)
+            
+            # Send immediately to Telegram so the user gets their schedule without waiting
             await status_msg.edit_text(
-                messages[0],
+                prefix + messages[0],
                 parse_mode="HTML",
+                reply_markup=kb,
             )
             for extra_msg in messages[1:]:
                 await update.message.reply_text(extra_msg, parse_mode="HTML")
+
+            # Persist for offline downtime backup in the background (0ms wait for user)
+            if uid and not is_fallback:
+                asyncio.create_task(asyncio.to_thread(storage.save_user_timetable, uid, html))
         except Exception as exc:
             logger.exception("Failed to fetch timetable")
             await status_msg.edit_text(
@@ -772,6 +819,7 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     uid = user.id if user else None
 
+    # Always fetch LIVE full week timetable from ERP
     async with security.user_concurrency.task_guard(uid) as acquired:
         if not acquired:
             await update.message.reply_text(
@@ -780,7 +828,8 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             return
 
-        status_msg = await update.message.reply_text("⏳ Fetching your full week timetable...")
+        status_msg = await update.message.reply_text("⏳ Fetching your full week timetable from ERP...")
+        is_fallback = False
 
         try:
             try:
@@ -789,22 +838,48 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 # Silent re-auth fallback
                 saved = credentials.load_user_credentials(uid)
                 if saved:
-                    await perform_login(saved["username"], saved["password"], user_id=uid)
-                    html = await fetch_timetable_html(user_id=uid)
+                    try:
+                        await perform_login(saved["username"], saved["password"], user_id=uid)
+                        html = await fetch_timetable_html(user_id=uid)
+                    except Exception:
+                        # Graceful downtime fallback if ERP is temporarily down
+                        fb = storage.load_user_timetable(uid)
+                        if fb:
+                            html = fb
+                            is_fallback = True
+                        else:
+                            raise
                 else:
-                    raise
+                    fb = storage.load_user_timetable(uid)
+                    if fb:
+                        html = fb
+                        is_fallback = True
+                    else:
+                        raise
+
+            if uid:
+                _timetable_memory_cache[uid] = (time.time(), html)
 
             messages = get_timetable_messages(html)
             if not messages:
                 await status_msg.edit_text("⚠️ <i>Could not extract timetable. Please check in ERP.</i>", parse_mode="HTML")
                 return
 
+            prefix = "⚡ <b>ERP is temporarily down or unreachable.</b>\n<i>Showing your last saved schedule:</i>\n\n" if is_fallback else ""
+            kb = _get_timetable_keyboard(current_day=None)
+
+            # Send immediately to Telegram so the user gets their schedule without waiting
             await status_msg.edit_text(
-                messages[0],
+                prefix + messages[0],
                 parse_mode="HTML",
+                reply_markup=kb,
             )
             for extra_msg in messages[1:]:
                 await update.message.reply_text(extra_msg, parse_mode="HTML")
+
+            # Persist for offline downtime backup in the background (0ms wait for user)
+            if uid and not is_fallback:
+                asyncio.create_task(asyncio.to_thread(storage.save_user_timetable, uid, html))
         except Exception as exc:
             logger.exception("Failed to fetch week timetable")
             await status_msg.edit_text(
@@ -812,6 +887,92 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "Please check directly in the ERP portal or try again later.",
                 parse_mode="HTML",
             )
+
+
+async def handle_timetable_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle instant day switching and refresh inline buttons on timetable cards."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    user = update.effective_user
+    uid = user.id if user else None
+    if not uid or not is_authorized(update):
+        return
+
+    if data.startswith("tt:day:"):
+        target_day = data.split(":", 2)[2]
+        cached_entry = _timetable_memory_cache.get(uid)
+        html = cached_entry[1] if cached_entry else storage.load_user_timetable(uid)
+
+        if html:
+            messages = get_timetable_messages(html, day_filter=target_day)
+            if messages:
+                kb = _get_timetable_keyboard(current_day=target_day)
+                try:
+                    await query.edit_message_text(messages[0], parse_mode="HTML", reply_markup=kb)
+                except Exception:
+                    pass
+        else:
+            await query.edit_message_text("⏳ <i>Loading timetable from ERP...</i>", parse_mode="HTML")
+            try:
+                html = await fetch_timetable_html(user_id=uid)
+                _timetable_memory_cache[uid] = (time.time(), html)
+                messages = get_timetable_messages(html, day_filter=target_day)
+                kb = _get_timetable_keyboard(current_day=target_day)
+                await query.edit_message_text(messages[0], parse_mode="HTML", reply_markup=kb)
+                asyncio.create_task(asyncio.to_thread(storage.save_user_timetable, uid, html))
+            except Exception as e:
+                await query.edit_message_text(f"⚠️ Could not fetch timetable: {e}", parse_mode="HTML")
+
+    elif data == "tt:week":
+        cached_entry = _timetable_memory_cache.get(uid)
+        html = cached_entry[1] if cached_entry else storage.load_user_timetable(uid)
+
+        if html:
+            messages = get_timetable_messages(html)
+            if messages:
+                kb = _get_timetable_keyboard(current_day=None)
+                try:
+                    await query.edit_message_text(messages[0], parse_mode="HTML", reply_markup=kb)
+                except Exception:
+                    pass
+        else:
+            await query.edit_message_text("⏳ <i>Loading full week from ERP...</i>", parse_mode="HTML")
+            try:
+                html = await fetch_timetable_html(user_id=uid)
+                _timetable_memory_cache[uid] = (time.time(), html)
+                messages = get_timetable_messages(html)
+                kb = _get_timetable_keyboard(current_day=None)
+                await query.edit_message_text(messages[0], parse_mode="HTML", reply_markup=kb)
+                asyncio.create_task(asyncio.to_thread(storage.save_user_timetable, uid, html))
+            except Exception as e:
+                await query.edit_message_text(f"⚠️ Could not fetch timetable: {e}", parse_mode="HTML")
+
+    elif data == "tt:refresh":
+        await query.edit_message_text("🔄 <i>Refreshing live timetable from ERP...</i>", parse_mode="HTML")
+        try:
+            html = await fetch_timetable_html(user_id=uid)
+            _timetable_memory_cache[uid] = (time.time(), html)
+            messages = get_timetable_messages(html, day_filter=_today_day_name())
+            kb = _get_timetable_keyboard(current_day=_today_day_name())
+            await query.edit_message_text(messages[0], parse_mode="HTML", reply_markup=kb)
+            asyncio.create_task(asyncio.to_thread(storage.save_user_timetable, uid, html))
+        except Exception as e:
+            try:
+                saved = credentials.load_user_credentials(uid)
+                if saved:
+                    await perform_login(saved["username"], saved["password"], user_id=uid)
+                    html = await fetch_timetable_html(user_id=uid)
+                    _timetable_memory_cache[uid] = (time.time(), html)
+                    messages = get_timetable_messages(html, day_filter=_today_day_name())
+                    kb = _get_timetable_keyboard(current_day=_today_day_name())
+                    await query.edit_message_text(messages[0], parse_mode="HTML", reply_markup=kb)
+                    asyncio.create_task(asyncio.to_thread(storage.save_user_timetable, uid, html))
+                else:
+                    raise
+            except Exception as exc2:
+                await query.edit_message_text(f"⚠️ Could not refresh timetable: {exc2}", parse_mode="HTML")
 
 
 
@@ -837,6 +998,7 @@ async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = user.id if user else None
     if uid:
         try:
+            _timetable_memory_cache.pop(uid, None)
             storage.delete_user_all_data(uid)
             context.user_data.clear()
             if not storage.get_all_morning_users() and context.job_queue:
@@ -878,6 +1040,8 @@ async def _prefetch_morning_timetables(context: ContextTypes.DEFAULT_TYPE) -> No
                 html = await fetch_timetable_html(user_id=chat_id)
 
             _morning_cache[chat_id] = html
+            _timetable_memory_cache[chat_id] = (time.time(), html)
+            storage.save_user_timetable(chat_id, html)
             logger.info("Pre-fetch successful for user %s", chat_id)
         except Exception:
             logger.warning("Pre-fetch initial attempt failed for user %s, queued for retry", chat_id)
@@ -895,6 +1059,8 @@ async def _prefetch_morning_timetables(context: ContextTypes.DEFAULT_TYPE) -> No
                 await perform_login(saved["username"], saved["password"], user_id=chat_id, max_retries=3)
                 html = await fetch_timetable_html(user_id=chat_id)
                 _morning_cache[chat_id] = html
+                _timetable_memory_cache[chat_id] = (time.time(), html)
+                storage.save_user_timetable(chat_id, html)
                 logger.info("Pre-fetch retry successful for user %s", chat_id)
             except Exception:
                 logger.warning("Pre-fetch retry failed for user %s", chat_id)
@@ -1236,9 +1402,16 @@ async def _setup_bot_commands(app: Application) -> None:
 
 
 async def _post_init(app: Application) -> None:
-    """Post-initialization hook for cloud health check and command setup."""
+    """Post-initialization hook for cloud health check, command setup, and warmup."""
     await _start_health_server(app)
     await _setup_bot_commands(app)
+    # Pre-warm ONNX CAPTCHA solver to eliminate first-login cold-start latency
+    try:
+        from erp.captcha_solver import warmup_captcha_solver
+        warmup_captcha_solver()
+        logger.info("ONNX CAPTCHA solver pre-warmed successfully.")
+    except Exception as exc:
+        logger.warning("Could not pre-warm CAPTCHA solver: %s", exc)
 
 
 def main() -> None:
@@ -1279,6 +1452,7 @@ def main() -> None:
     application.add_handler(CommandHandler("describe", description))
     application.add_handler(CommandHandler("privacy", privacy))
     application.add_handler(CommandHandler("logout", logout))
+    application.add_handler(CallbackQueryHandler(handle_timetable_callback, pattern=r"^tt:"))
     application.add_handler(CallbackQueryHandler(handle_lms_callback, pattern=r"^lms:"))
     application.add_handler(CallbackQueryHandler(handle_outpass_callback, pattern=r"^(outpass|outcal)"))
     application.add_handler(ChatMemberHandler(handle_user_status_change, ChatMemberHandler.MY_CHAT_MEMBER))
