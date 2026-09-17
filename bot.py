@@ -71,24 +71,7 @@ MORNING_PREFETCH_JOB_NAME = "morning_prefetch"
 LMS_ALERTS_JOB_NAME = "lms_alerts_checker"
 _morning_cache: dict[int, str] = {}
 
-# Fast in-memory timetable cache: user_id -> (timestamp, html)
-_timetable_memory_cache: dict[int, tuple[float, str]] = {}
-TIMETABLE_CACHE_TTL = 1800.0  # 30-minute fast cache TTL for instant responses (<0.05s)
 
-
-def _get_timetable_keyboard(current_day: Optional[str] = None) -> InlineKeyboardMarkup:
-    """Generate quick-switch buttons for days, full week view, and fresh sync."""
-    day_abbrs = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
-    row1 = []
-    for d in day_abbrs:
-        is_active = (current_day or "").lower().startswith(d.lower())
-        label = f"•{d}•" if is_active else d
-        row1.append(InlineKeyboardButton(label, callback_data=f"tt:day:{d}"))
-    row2 = [
-        InlineKeyboardButton("🗓️ Full Week", callback_data="tt:week"),
-        InlineKeyboardButton("🔄 Refresh", callback_data="tt:refresh"),
-    ]
-    return InlineKeyboardMarkup([row1, row2])
 
 
 def _is_morning_enabled(user_id: Optional[int] = None) -> bool:
@@ -768,21 +751,15 @@ async def timetable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     )
                     return
 
-            if uid:
-                _timetable_memory_cache[uid] = (time.time(), html)
-
             messages = get_timetable_messages(html, day_filter=day)
             if not messages:
                 await status_msg.edit_text("⚠️ <i>Could not extract timetable. Please check in ERP.</i>", parse_mode="HTML")
                 return
 
-            kb = _get_timetable_keyboard(current_day=day)
-            
-            # Send immediately to Telegram so the user gets their schedule without waiting
+            # Send timetable directly without inline buttons
             await status_msg.edit_text(
                 messages[0],
                 parse_mode="HTML",
-                reply_markup=kb,
             )
             for extra_msg in messages[1:]:
                 await update.message.reply_text(extra_msg, parse_mode="HTML")
@@ -831,21 +808,15 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     )
                     return
 
-            if uid:
-                _timetable_memory_cache[uid] = (time.time(), html)
-
             messages = get_timetable_messages(html)
             if not messages:
                 await status_msg.edit_text("⚠️ <i>Could not extract timetable. Please check in ERP.</i>", parse_mode="HTML")
                 return
 
-            kb = _get_timetable_keyboard(current_day=None)
-
-            # Send immediately to Telegram so the user gets their schedule without waiting
+            # Send full week timetable directly without inline buttons
             await status_msg.edit_text(
                 messages[0],
                 parse_mode="HTML",
-                reply_markup=kb,
             )
             for extra_msg in messages[1:]:
                 await update.message.reply_text(extra_msg, parse_mode="HTML")
@@ -857,103 +828,6 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "Please check directly in the ERP portal or try again later.",
                 parse_mode="HTML",
             )
-
-
-async def handle_timetable_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle instant day switching and refresh inline buttons on timetable cards."""
-    query = update.callback_query
-    await query.answer()
-
-    data = query.data
-    user = update.effective_user
-    uid = user.id if user else None
-    if not uid or not is_authorized(update):
-        return
-
-    if data.startswith("tt:day:"):
-        target_day = data.split(":", 2)[2]
-        cached_entry = _timetable_memory_cache.get(uid)
-        html = cached_entry[1] if cached_entry else None
-
-        if html:
-            messages = get_timetable_messages(html, day_filter=target_day)
-            if messages:
-                kb = _get_timetable_keyboard(current_day=target_day)
-                try:
-                    await query.edit_message_text(messages[0], parse_mode="HTML", reply_markup=kb)
-                except Exception:
-                    pass
-        else:
-            await query.edit_message_text("⏳ <i>Fetching live timetable from ERP...</i>", parse_mode="HTML")
-            try:
-                try:
-                    html = await fetch_timetable_html(user_id=uid)
-                except Exception:
-                    saved = credentials.load_user_credentials(uid)
-                    if saved:
-                        await perform_login(saved["username"], saved["password"], user_id=uid)
-                        html = await fetch_timetable_html(user_id=uid)
-                    else:
-                        raise RuntimeError("No active session or stored credentials. Please log in with /login first.")
-
-                _timetable_memory_cache[uid] = (time.time(), html)
-                messages = get_timetable_messages(html, day_filter=target_day)
-                kb = _get_timetable_keyboard(current_day=target_day)
-                await query.edit_message_text(messages[0], parse_mode="HTML", reply_markup=kb)
-            except Exception as e:
-                await query.edit_message_text(f"⚠️ Could not fetch live timetable: {e}", parse_mode="HTML")
-
-    elif data == "tt:week":
-        cached_entry = _timetable_memory_cache.get(uid)
-        html = cached_entry[1] if cached_entry else None
-
-        if html:
-            messages = get_timetable_messages(html)
-            if messages:
-                kb = _get_timetable_keyboard(current_day=None)
-                try:
-                    await query.edit_message_text(messages[0], parse_mode="HTML", reply_markup=kb)
-                except Exception:
-                    pass
-        else:
-            await query.edit_message_text("⏳ <i>Fetching live full week from ERP...</i>", parse_mode="HTML")
-            try:
-                try:
-                    html = await fetch_timetable_html(user_id=uid)
-                except Exception:
-                    saved = credentials.load_user_credentials(uid)
-                    if saved:
-                        await perform_login(saved["username"], saved["password"], user_id=uid)
-                        html = await fetch_timetable_html(user_id=uid)
-                    else:
-                        raise RuntimeError("No active session or stored credentials. Please log in with /login first.")
-
-                _timetable_memory_cache[uid] = (time.time(), html)
-                messages = get_timetable_messages(html)
-                kb = _get_timetable_keyboard(current_day=None)
-                await query.edit_message_text(messages[0], parse_mode="HTML", reply_markup=kb)
-            except Exception as e:
-                await query.edit_message_text(f"⚠️ Could not fetch live timetable: {e}", parse_mode="HTML")
-
-    elif data == "tt:refresh":
-        await query.edit_message_text("🔄 <i>Refreshing live timetable from ERP...</i>", parse_mode="HTML")
-        try:
-            try:
-                html = await fetch_timetable_html(user_id=uid)
-            except Exception:
-                saved = credentials.load_user_credentials(uid)
-                if saved:
-                    await perform_login(saved["username"], saved["password"], user_id=uid)
-                    html = await fetch_timetable_html(user_id=uid)
-                else:
-                    raise RuntimeError("No active session or stored credentials. Please log in with /login first.")
-
-            _timetable_memory_cache[uid] = (time.time(), html)
-            messages = get_timetable_messages(html, day_filter=_today_day_name())
-            kb = _get_timetable_keyboard(current_day=_today_day_name())
-            await query.edit_message_text(messages[0], parse_mode="HTML", reply_markup=kb)
-        except Exception as exc:
-            await query.edit_message_text(f"⚠️ Could not refresh live timetable: {exc}", parse_mode="HTML")
 
 
 
@@ -979,7 +853,6 @@ async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = user.id if user else None
     if uid:
         try:
-            _timetable_memory_cache.pop(uid, None)
             reset_user_client(uid)
             storage.delete_user_all_data(uid)
             context.user_data.clear()
@@ -1022,7 +895,6 @@ async def _prefetch_morning_timetables(context: ContextTypes.DEFAULT_TYPE) -> No
                 html = await fetch_timetable_html(user_id=chat_id)
 
             _morning_cache[chat_id] = html
-            _timetable_memory_cache[chat_id] = (time.time(), html)
             logger.info("Pre-fetch successful for user %s", chat_id)
         except Exception:
             logger.warning("Pre-fetch initial attempt failed for user %s, queued for retry", chat_id)
@@ -1040,7 +912,6 @@ async def _prefetch_morning_timetables(context: ContextTypes.DEFAULT_TYPE) -> No
                 await perform_login(saved["username"], saved["password"], user_id=chat_id, max_retries=3)
                 html = await fetch_timetable_html(user_id=chat_id)
                 _morning_cache[chat_id] = html
-                _timetable_memory_cache[chat_id] = (time.time(), html)
                 logger.info("Pre-fetch retry successful for user %s", chat_id)
             except Exception:
                 logger.warning("Pre-fetch retry failed for user %s", chat_id)
@@ -1432,7 +1303,6 @@ def main() -> None:
     application.add_handler(CommandHandler("describe", description))
     application.add_handler(CommandHandler("privacy", privacy))
     application.add_handler(CommandHandler("logout", logout))
-    application.add_handler(CallbackQueryHandler(handle_timetable_callback, pattern=r"^tt:"))
     application.add_handler(CallbackQueryHandler(handle_lms_callback, pattern=r"^lms:"))
     application.add_handler(CallbackQueryHandler(handle_outpass_callback, pattern=r"^(outpass|outcal)"))
     application.add_handler(ChatMemberHandler(handle_user_status_change, ChatMemberHandler.MY_CHAT_MEMBER))

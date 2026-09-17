@@ -60,8 +60,8 @@ def run_tests():
     print(f"  ⚡ Inference speed on CAPTCHA image: {t_infer:.2f} ms")
     print("  ✅ CAPTCHA Pre-warm & Inference Test: PASSED")
 
-    # 3. Test In-Memory Live Day Switcher & Per-User Cookie Isolation
-    print("\n[3/3] Testing In-Memory Live Day Switcher & Per-User Cookie Isolation...")
+    # 3. Test Live Timetable Parsing & Per-User Cookie Isolation
+    print("\n[3/3] Testing Live Timetable Parsing & Per-User Cookie Isolation...")
     mock_html = """
     <html>
         <body>
@@ -73,13 +73,11 @@ def run_tests():
         </body>
     </html>
     """
-    bot._timetable_memory_cache[test_uid] = (time.time(), mock_html)
-
-    # Test instant day switching on the freshly fetched live timetable
+    # Test timetable message extraction speed
     t0 = time.perf_counter()
     tue_messages = get_timetable_messages(mock_html, day_filter="Tue")
-    t_switch = (time.perf_counter() - t0) * 1000
-    print(f"  ⚡ Live Day Tab switch (Mon -> Tue): {t_switch:.3f} ms")
+    t_parse = (time.perf_counter() - t0) * 1000
+    print(f"  ⚡ Live Timetable Parsing speed: {t_parse:.3f} ms")
     assert len(tue_messages) > 0
 
     # Test per-user client isolation (ensures zero cross-user cookie leakage)
@@ -91,9 +89,7 @@ def run_tests():
     reset_user_client(10001)
     reset_user_client(10002)
     print("  ✅ Per-User Client & Cookie Isolation: PASSED (100% Zero Leakage)")
-
-    bot._timetable_memory_cache.pop(test_uid, None)
-    print("  ✅ Live Timetable & Instant Day Switcher: PASSED (Live ERP + In-Memory Day Tabs)")
+    print("  ✅ Live Timetable Parsing: PASSED (Direct clean messages without extra UI buttons)")
 
     print("\n" + "=" * 60)
     print("🎉 ALL TESTS PASSED! The bot is optimized and ready to run.")
