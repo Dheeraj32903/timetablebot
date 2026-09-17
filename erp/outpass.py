@@ -7,7 +7,7 @@ import httpx
 
 import config
 from credentials import load_user_credentials
-from erp.client import _get_headers, get_erp_client
+from erp.client import _get_headers, get_erp_client_for_user
 from erp.session import _cookies_for_request, load_session, perform_login
 from security import backend_throttle
 
@@ -30,7 +30,7 @@ async def _get_authenticated_client(user_id: Optional[int] = None) -> Tuple[http
     csrf_token = sess.get("csrf_token", "") if sess else ""
 
     headers = _get_headers()
-    client = get_erp_client(timeout=30.0)
+    client = get_erp_client_for_user(user_id=user_id, timeout=30.0)
 
     req_cookies = _cookies_for_request(cookies) if cookies else {}
     preloaded_html: Optional[str] = None

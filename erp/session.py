@@ -9,12 +9,9 @@ from urllib.parse import unquote
 
 import config
 import storage
-from erp.client import auto_login, fetch_timetable
+from erp.client import auto_login, fetch_timetable, reset_user_client
 
 logger = logging.getLogger(__name__)
-
-
-SESSION_PATH: Path = config.SESSION_FILE
 
 
 def _normalize_cookies(cookies) -> dict:
@@ -30,40 +27,20 @@ def _normalize_cookies(cookies) -> dict:
 
 
 def save_session(cookies: dict, csrf_token: Optional[str] = None, user_id: Optional[int] = None) -> None:
-    """Save session cookies per-user in MongoDB/storage and locally as fallback."""
+    """Save session cookies strictly per-user in storage."""
     norm_cookies = _normalize_cookies(cookies)
-    
     if user_id is not None:
         storage.save_user_session(user_id, norm_cookies, csrf_token)
 
-    # Local fallback file
-    try:
-        payload = {
-            "cookies": norm_cookies,
-            "csrf_token": csrf_token,
-        }
-        SESSION_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    except Exception:
-        pass
-
 
 def load_session(user_id: Optional[int] = None) -> dict:
-    """Load active session for a specific user or fallback to local session file."""
+    """Load active session strictly for the specified user."""
     if user_id is not None:
         sess = storage.load_user_session(user_id)
         if sess and sess.get("cookies"):
             sess["cookies"] = _normalize_cookies(sess["cookies"])
             return sess
-
-    if not SESSION_PATH.exists():
-        return {}
-    try:
-        data = json.loads(SESSION_PATH.read_text(encoding="utf-8"))
-        if "cookies" in data:
-            data["cookies"] = _normalize_cookies(data["cookies"])
-        return data
-    except Exception:
-        return {}
+    return {}
 
 
 def session_to_cookie_header(cookies: dict) -> str:
@@ -98,12 +75,15 @@ async def perform_login(
     Uses gentle pacing and randomized backoff to avoid flooding ERP servers.
     Saves and returns the authenticated session for the given user.
     """
+    if user_id is not None:
+        reset_user_client(user_id)
+
     retries = max_retries if max_retries is not None else config.LOGIN_MAX_RETRIES
     last_error: Optional[Exception] = None
 
     for attempt in range(1, retries + 1):
         try:
-            result = await auto_login(username, password)
+            result = await auto_login(username, password, user_id=user_id)
             cookies = result["cookies"]
             csrf_token = result.get("csrf_token")
             save_session(cookies, csrf_token, user_id=user_id)
@@ -162,7 +142,13 @@ async def fetch_timetable_html(
         if match:
             semester_id = match.group(1)
 
-    html = await fetch_timetable(_cookies_for_request(cookies), csrf_token or "", academic_year_code, semester_id)
+    html = await fetch_timetable(
+        _cookies_for_request(cookies),
+        csrf_token or "",
+        academic_year_code,
+        semester_id,
+        user_id=user_id,
+    )
 
     if not html.strip():
         raise RuntimeError("ERP returned an empty timetable response.")

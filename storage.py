@@ -53,7 +53,6 @@ def is_mongodb_active() -> bool:
 _credentials_cache: dict[int, dict] = {}
 _session_cache: dict[int, dict] = {}
 _morning_status_cache: dict[int, bool] = {}
-_timetable_cache: dict[int, str] = {}
 _lms_creds_cache: dict[int, dict] = {}
 _lms_token_cache: dict[int, str] = {}
 
@@ -250,53 +249,26 @@ def get_all_morning_users() -> list[int]:
     return user_ids
 
 
-def save_user_timetable(user_id: int, timetable_html: str) -> None:
-    """Save the latest fetched timetable HTML for a user to memory cache and MongoDB for offline fallback."""
-    uid = int(user_id)
-    _timetable_cache[uid] = timetable_html
-    now_iso = datetime.now(timezone.utc).isoformat()
+def purge_all_database_timetables() -> int:
+    """Purge all stored timetables from MongoDB so the bot only uses live ERP data."""
     try:
-        _mongo_db.users.update_one(
-            {"_id": uid},
-            {
-                "$set": {
-                    "cached_timetable": {
-                        "html": timetable_html,
-                        "updated_at": now_iso,
-                    }
-                }
-            },
-            upsert=True,
+        res = _mongo_db.users.update_many(
+            {"cached_timetable": {"$exists": True}},
+            {"$unset": {"cached_timetable": ""}},
         )
+        logger.info("Purged cached_timetable from %d MongoDB users", res.modified_count)
+        return res.modified_count
     except Exception as exc:
-        logger.error("Error saving cached timetable in MongoDB: %s", exc)
-
-
-def load_user_timetable(user_id: int) -> Optional[str]:
-    """Load the latest cached timetable HTML for a user from memory cache or MongoDB."""
-    uid = int(user_id)
-    if uid in _timetable_cache:
-        return _timetable_cache[uid]
-
-    try:
-        doc = _mongo_db.users.find_one({"_id": uid})
-        if doc and doc.get("cached_timetable"):
-            html = doc["cached_timetable"].get("html")
-            if html:
-                _timetable_cache[uid] = html
-                return html
-    except Exception as exc:
-        logger.error("Error loading cached timetable from MongoDB: %s", exc)
-    return None
+        logger.error("Error purging cached timetables from MongoDB: %s", exc)
+        return 0
 
 
 def delete_user_all_data(user_id: int) -> bool:
-    """Completely remove all stored user data (credentials, session, morning settings, timetable, LMS) from memory and MongoDB."""
+    """Completely remove all stored user data (credentials, session, morning settings, LMS) from memory and MongoDB."""
     uid = int(user_id)
     _credentials_cache.pop(uid, None)
     _session_cache.pop(uid, None)
     _morning_status_cache.pop(uid, None)
-    _timetable_cache.pop(uid, None)
     _lms_creds_cache.pop(uid, None)
     _lms_token_cache.pop(uid, None)
 

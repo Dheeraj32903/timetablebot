@@ -36,7 +36,7 @@ import credentials
 import security
 import storage
 from erp.session import perform_login, fetch_timetable_html, load_session
-from erp.client import auto_login
+from erp.client import auto_login, reset_user_client
 from parser.timetable import (
     format_timetable_for_telegram,
     get_timetable_messages,
@@ -751,33 +751,22 @@ async def timetable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         status_msg = await update.message.reply_text("⏳ Fetching your live timetable from ERP...")
-        is_fallback = False
 
         try:
             try:
                 html = await fetch_timetable_html(user_id=uid)
             except Exception:
-                # Silent re-auth fallback
+                # Silent re-auth fallback with this user's stored credentials
                 saved = credentials.load_user_credentials(uid)
                 if saved:
-                    try:
-                        await perform_login(saved["username"], saved["password"], user_id=uid)
-                        html = await fetch_timetable_html(user_id=uid)
-                    except Exception:
-                        # Graceful downtime fallback if ERP is temporarily down
-                        fb = storage.load_user_timetable(uid)
-                        if fb:
-                            html = fb
-                            is_fallback = True
-                        else:
-                            raise
+                    await perform_login(saved["username"], saved["password"], user_id=uid)
+                    html = await fetch_timetable_html(user_id=uid)
                 else:
-                    fb = storage.load_user_timetable(uid)
-                    if fb:
-                        html = fb
-                        is_fallback = True
-                    else:
-                        raise
+                    await status_msg.edit_text(
+                        "⚠️ <b>No active ERP session.</b>\nPlease log in using /login first to fetch your live timetable.",
+                        parse_mode="HTML",
+                    )
+                    return
 
             if uid:
                 _timetable_memory_cache[uid] = (time.time(), html)
@@ -787,21 +776,17 @@ async def timetable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 await status_msg.edit_text("⚠️ <i>Could not extract timetable. Please check in ERP.</i>", parse_mode="HTML")
                 return
 
-            prefix = "⚡ <b>ERP is temporarily down or unreachable.</b>\n<i>Showing your last saved schedule:</i>\n\n" if is_fallback else ""
             kb = _get_timetable_keyboard(current_day=day)
             
             # Send immediately to Telegram so the user gets their schedule without waiting
             await status_msg.edit_text(
-                prefix + messages[0],
+                messages[0],
                 parse_mode="HTML",
                 reply_markup=kb,
             )
             for extra_msg in messages[1:]:
                 await update.message.reply_text(extra_msg, parse_mode="HTML")
 
-            # Persist for offline downtime backup in the background (0ms wait for user)
-            if uid and not is_fallback:
-                asyncio.create_task(asyncio.to_thread(storage.save_user_timetable, uid, html))
         except Exception as exc:
             logger.exception("Failed to fetch timetable")
             await status_msg.edit_text(
@@ -829,33 +814,22 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         status_msg = await update.message.reply_text("⏳ Fetching your full week timetable from ERP...")
-        is_fallback = False
 
         try:
             try:
                 html = await fetch_timetable_html(user_id=uid)
             except Exception:
-                # Silent re-auth fallback
+                # Silent re-auth fallback with this user's stored credentials
                 saved = credentials.load_user_credentials(uid)
                 if saved:
-                    try:
-                        await perform_login(saved["username"], saved["password"], user_id=uid)
-                        html = await fetch_timetable_html(user_id=uid)
-                    except Exception:
-                        # Graceful downtime fallback if ERP is temporarily down
-                        fb = storage.load_user_timetable(uid)
-                        if fb:
-                            html = fb
-                            is_fallback = True
-                        else:
-                            raise
+                    await perform_login(saved["username"], saved["password"], user_id=uid)
+                    html = await fetch_timetable_html(user_id=uid)
                 else:
-                    fb = storage.load_user_timetable(uid)
-                    if fb:
-                        html = fb
-                        is_fallback = True
-                    else:
-                        raise
+                    await status_msg.edit_text(
+                        "⚠️ <b>No active ERP session.</b>\nPlease log in using /login first to fetch your live timetable.",
+                        parse_mode="HTML",
+                    )
+                    return
 
             if uid:
                 _timetable_memory_cache[uid] = (time.time(), html)
@@ -865,21 +839,17 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 await status_msg.edit_text("⚠️ <i>Could not extract timetable. Please check in ERP.</i>", parse_mode="HTML")
                 return
 
-            prefix = "⚡ <b>ERP is temporarily down or unreachable.</b>\n<i>Showing your last saved schedule:</i>\n\n" if is_fallback else ""
             kb = _get_timetable_keyboard(current_day=None)
 
             # Send immediately to Telegram so the user gets their schedule without waiting
             await status_msg.edit_text(
-                prefix + messages[0],
+                messages[0],
                 parse_mode="HTML",
                 reply_markup=kb,
             )
             for extra_msg in messages[1:]:
                 await update.message.reply_text(extra_msg, parse_mode="HTML")
 
-            # Persist for offline downtime backup in the background (0ms wait for user)
-            if uid and not is_fallback:
-                asyncio.create_task(asyncio.to_thread(storage.save_user_timetable, uid, html))
         except Exception as exc:
             logger.exception("Failed to fetch week timetable")
             await status_msg.edit_text(
@@ -903,7 +873,7 @@ async def handle_timetable_callback(update: Update, context: ContextTypes.DEFAUL
     if data.startswith("tt:day:"):
         target_day = data.split(":", 2)[2]
         cached_entry = _timetable_memory_cache.get(uid)
-        html = cached_entry[1] if cached_entry else storage.load_user_timetable(uid)
+        html = cached_entry[1] if cached_entry else None
 
         if html:
             messages = get_timetable_messages(html, day_filter=target_day)
@@ -914,20 +884,28 @@ async def handle_timetable_callback(update: Update, context: ContextTypes.DEFAUL
                 except Exception:
                     pass
         else:
-            await query.edit_message_text("⏳ <i>Loading timetable from ERP...</i>", parse_mode="HTML")
+            await query.edit_message_text("⏳ <i>Fetching live timetable from ERP...</i>", parse_mode="HTML")
             try:
-                html = await fetch_timetable_html(user_id=uid)
+                try:
+                    html = await fetch_timetable_html(user_id=uid)
+                except Exception:
+                    saved = credentials.load_user_credentials(uid)
+                    if saved:
+                        await perform_login(saved["username"], saved["password"], user_id=uid)
+                        html = await fetch_timetable_html(user_id=uid)
+                    else:
+                        raise RuntimeError("No active session or stored credentials. Please log in with /login first.")
+
                 _timetable_memory_cache[uid] = (time.time(), html)
                 messages = get_timetable_messages(html, day_filter=target_day)
                 kb = _get_timetable_keyboard(current_day=target_day)
                 await query.edit_message_text(messages[0], parse_mode="HTML", reply_markup=kb)
-                asyncio.create_task(asyncio.to_thread(storage.save_user_timetable, uid, html))
             except Exception as e:
-                await query.edit_message_text(f"⚠️ Could not fetch timetable: {e}", parse_mode="HTML")
+                await query.edit_message_text(f"⚠️ Could not fetch live timetable: {e}", parse_mode="HTML")
 
     elif data == "tt:week":
         cached_entry = _timetable_memory_cache.get(uid)
-        html = cached_entry[1] if cached_entry else storage.load_user_timetable(uid)
+        html = cached_entry[1] if cached_entry else None
 
         if html:
             messages = get_timetable_messages(html)
@@ -938,41 +916,44 @@ async def handle_timetable_callback(update: Update, context: ContextTypes.DEFAUL
                 except Exception:
                     pass
         else:
-            await query.edit_message_text("⏳ <i>Loading full week from ERP...</i>", parse_mode="HTML")
+            await query.edit_message_text("⏳ <i>Fetching live full week from ERP...</i>", parse_mode="HTML")
             try:
-                html = await fetch_timetable_html(user_id=uid)
+                try:
+                    html = await fetch_timetable_html(user_id=uid)
+                except Exception:
+                    saved = credentials.load_user_credentials(uid)
+                    if saved:
+                        await perform_login(saved["username"], saved["password"], user_id=uid)
+                        html = await fetch_timetable_html(user_id=uid)
+                    else:
+                        raise RuntimeError("No active session or stored credentials. Please log in with /login first.")
+
                 _timetable_memory_cache[uid] = (time.time(), html)
                 messages = get_timetable_messages(html)
                 kb = _get_timetable_keyboard(current_day=None)
                 await query.edit_message_text(messages[0], parse_mode="HTML", reply_markup=kb)
-                asyncio.create_task(asyncio.to_thread(storage.save_user_timetable, uid, html))
             except Exception as e:
-                await query.edit_message_text(f"⚠️ Could not fetch timetable: {e}", parse_mode="HTML")
+                await query.edit_message_text(f"⚠️ Could not fetch live timetable: {e}", parse_mode="HTML")
 
     elif data == "tt:refresh":
         await query.edit_message_text("🔄 <i>Refreshing live timetable from ERP...</i>", parse_mode="HTML")
         try:
-            html = await fetch_timetable_html(user_id=uid)
-            _timetable_memory_cache[uid] = (time.time(), html)
-            messages = get_timetable_messages(html, day_filter=_today_day_name())
-            kb = _get_timetable_keyboard(current_day=_today_day_name())
-            await query.edit_message_text(messages[0], parse_mode="HTML", reply_markup=kb)
-            asyncio.create_task(asyncio.to_thread(storage.save_user_timetable, uid, html))
-        except Exception as e:
             try:
+                html = await fetch_timetable_html(user_id=uid)
+            except Exception:
                 saved = credentials.load_user_credentials(uid)
                 if saved:
                     await perform_login(saved["username"], saved["password"], user_id=uid)
                     html = await fetch_timetable_html(user_id=uid)
-                    _timetable_memory_cache[uid] = (time.time(), html)
-                    messages = get_timetable_messages(html, day_filter=_today_day_name())
-                    kb = _get_timetable_keyboard(current_day=_today_day_name())
-                    await query.edit_message_text(messages[0], parse_mode="HTML", reply_markup=kb)
-                    asyncio.create_task(asyncio.to_thread(storage.save_user_timetable, uid, html))
                 else:
-                    raise
-            except Exception as exc2:
-                await query.edit_message_text(f"⚠️ Could not refresh timetable: {exc2}", parse_mode="HTML")
+                    raise RuntimeError("No active session or stored credentials. Please log in with /login first.")
+
+            _timetable_memory_cache[uid] = (time.time(), html)
+            messages = get_timetable_messages(html, day_filter=_today_day_name())
+            kb = _get_timetable_keyboard(current_day=_today_day_name())
+            await query.edit_message_text(messages[0], parse_mode="HTML", reply_markup=kb)
+        except Exception as exc:
+            await query.edit_message_text(f"⚠️ Could not refresh live timetable: {exc}", parse_mode="HTML")
 
 
 
@@ -999,6 +980,7 @@ async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if uid:
         try:
             _timetable_memory_cache.pop(uid, None)
+            reset_user_client(uid)
             storage.delete_user_all_data(uid)
             context.user_data.clear()
             if not storage.get_all_morning_users() and context.job_queue:
@@ -1041,7 +1023,6 @@ async def _prefetch_morning_timetables(context: ContextTypes.DEFAULT_TYPE) -> No
 
             _morning_cache[chat_id] = html
             _timetable_memory_cache[chat_id] = (time.time(), html)
-            storage.save_user_timetable(chat_id, html)
             logger.info("Pre-fetch successful for user %s", chat_id)
         except Exception:
             logger.warning("Pre-fetch initial attempt failed for user %s, queued for retry", chat_id)
@@ -1060,7 +1041,6 @@ async def _prefetch_morning_timetables(context: ContextTypes.DEFAULT_TYPE) -> No
                 html = await fetch_timetable_html(user_id=chat_id)
                 _morning_cache[chat_id] = html
                 _timetable_memory_cache[chat_id] = (time.time(), html)
-                storage.save_user_timetable(chat_id, html)
                 logger.info("Pre-fetch retry successful for user %s", chat_id)
             except Exception:
                 logger.warning("Pre-fetch retry failed for user %s", chat_id)

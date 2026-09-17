@@ -153,33 +153,63 @@ async def _follow_redirects(
     return resp, current_cookies
 
 
-_erp_shared_client: Optional[httpx.AsyncClient] = None
+_user_clients: dict[int, httpx.AsyncClient] = {}
+
+
+def get_erp_client_for_user(user_id: Optional[int] = None, timeout: float = 35.0) -> httpx.AsyncClient:
+    """
+    Return a dedicated AsyncClient with Keep-Alive connection pooling for this specific user.
+    Maintains persistent connections to newerp.kluniversity.in for ultra-fast live fetching,
+    while guaranteeing 100% cookie and session isolation between different users.
+    """
+    if user_id is not None:
+        uid = int(user_id)
+        client = _user_clients.get(uid)
+        if client is None or client.is_closed:
+            client = httpx.AsyncClient(
+                verify=True,
+                timeout=timeout,
+                limits=httpx.Limits(max_keepalive_connections=5, max_connections=10, keepalive_expiry=90.0),
+                http2=False,
+                follow_redirects=False,
+            )
+            _user_clients[uid] = client
+        return client
+
+    return httpx.AsyncClient(
+        verify=True,
+        timeout=timeout,
+        http2=False,
+        follow_redirects=False,
+    )
+
+
+def reset_user_client(user_id: int) -> None:
+    """Close and remove the dedicated AsyncClient for a user (called on logout or fresh login)."""
+    uid = int(user_id)
+    client = _user_clients.pop(uid, None)
+    if client and not client.is_closed:
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(client.aclose())
+        except RuntimeError:
+            pass
 
 
 def get_erp_client(timeout: float = 30.0) -> httpx.AsyncClient:
-    """
-    Return a shared persistent AsyncClient with HTTP Keep-Alive connection pooling.
-    Eliminates repetitive TCP 3-way handshakes and TLS renegotiation delays.
-    """
-    global _erp_shared_client
-    if _erp_shared_client is None or _erp_shared_client.is_closed:
-        _erp_shared_client = httpx.AsyncClient(
-            verify=True,
-            timeout=timeout,
-            limits=httpx.Limits(max_keepalive_connections=20, max_connections=30, keepalive_expiry=60.0),
-            http2=False,
-            follow_redirects=False,
-        )
-    return _erp_shared_client
+    """Backward-compatible fallback for callers without user_id context."""
+    return get_erp_client_for_user(None, timeout=timeout)
 
 
-async def auto_login(username: str, password: str) -> dict:
+async def auto_login(username: str, password: str, user_id: Optional[int] = None) -> dict:
     """
-    Log in to the ERP automatically using pooled HTTP connections.
+    Log in to the ERP automatically using the user's dedicated HTTP connection.
     Returns a dict with cookies and the logged-in page response.
     """
     headers = _get_headers()
-    client = get_erp_client(timeout=30.0)
+    client = get_erp_client_for_user(user_id=user_id, timeout=30.0)
+    # Clear any residual cookies for this user before logging in fresh
+    client.cookies.clear()
 
     async with backend_throttle.erp_semaphore:
         # Step 1: GET login page to collect CSRF and initial cookies.
@@ -252,9 +282,11 @@ async def fetch_timetable(
     csrf_token: str,
     academic_year_code: str = "29",
     semester_id: str = "1",
+    user_id: Optional[int] = None,
 ) -> str:
     """
-    Fetch the timetable HTML using the authenticated session over persistent HTTP pool.
+    Fetch the live timetable HTML using the authenticated session over the user's persistent HTTP pool.
+    Guarantees strict per-user cookie isolation.
     """
     headers = _get_headers()
     headers["Referer"] = (
@@ -262,15 +294,29 @@ async def fetch_timetable(
     )
     headers["Sec-Fetch-Site"] = "same-origin"
 
+    # Explicit cookie header to guarantee only this user's cookies are sent
+    req_cookies = dict(cookies)
+    for key in ("_csrf", "kl_erp_device_id"):
+        if key in req_cookies:
+            from urllib.parse import unquote
+            req_cookies[key] = unquote(req_cookies[key])
+
+    if req_cookies:
+        headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in req_cookies.items())
+
     tt_url = (
         f"{BASE_URL}/index.php?r=timetables%2Funiversitymasteracademictimetableview%2Findividualstudenttimetableget"
         f"&UniversityMasterAcademicTimetableView%5Bacademicyear%5D={academic_year_code}"
         f"&UniversityMasterAcademicTimetableView%5Bsemesterid%5D={semester_id}"
     )
 
-    client = get_erp_client(timeout=35.0)
+    client = get_erp_client_for_user(user_id=user_id, timeout=35.0)
+    client.cookies.clear()
+    if req_cookies:
+        client.cookies.update(req_cookies)
+
     async with backend_throttle.erp_semaphore:
-        response = await client.get(tt_url, cookies=cookies, headers=headers, follow_redirects=True, timeout=35.0)
+        response = await client.get(tt_url, cookies=req_cookies, headers=headers, follow_redirects=True, timeout=35.0)
         response.raise_for_status()
 
         if _is_login_failed(response):
