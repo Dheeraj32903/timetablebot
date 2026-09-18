@@ -229,6 +229,16 @@ async def submit_local_outpass(
                 return False, err_msg
 
             return True, "Local outpass applied successfully! Waiting for warden approval."
+        except (httpx.TimeoutException, httpx.NetworkError) as timeout_exc:
+            logger.warning("Network timeout during local outpass submission for user %s: %s. Performing post-timeout verification...", user_id, timeout_exc)
+            try:
+                history = await fetch_outpass_history(user_id=user_id)
+                for h in history:
+                    if h.get("outing_date") == date or date in h.get("out_time", ""):
+                        return True, f"Local outpass verified on ERP (Status: {h.get('status', 'Pending')})! It was processed before the network timeout."
+            except Exception as hist_err:
+                logger.error("Failed to verify outpass history after timeout: %s", hist_err)
+            return False, "ERP connection timed out during submission. Please check your outpass history before retrying."
         except Exception as e:
             logger.error("Failed to submit local outpass: %s", e)
             return False, str(e)
@@ -293,6 +303,17 @@ async def submit_home_outpass(
                 return False, err_msg
 
             return True, "Home outpass applied successfully! Waiting for warden approval."
+        except (httpx.TimeoutException, httpx.NetworkError) as timeout_exc:
+            target_date = out_datetime.split()[0] if " " in out_datetime else out_datetime
+            logger.warning("Network timeout during home outpass submission for user %s: %s. Performing post-timeout verification...", user_id, timeout_exc)
+            try:
+                history = await fetch_outpass_history(user_id=user_id)
+                for h in history:
+                    if h.get("outing_date") == target_date or target_date in h.get("out_time", ""):
+                        return True, f"Home outpass verified on ERP (Status: {h.get('status', 'Pending')})! It was processed before the network timeout."
+            except Exception as hist_err:
+                logger.error("Failed to verify home outpass history after timeout: %s", hist_err)
+            return False, "ERP connection timed out during submission. Please check your outpass history before retrying."
         except Exception as e:
             logger.error("Failed to submit home outpass: %s", e)
             return False, str(e)

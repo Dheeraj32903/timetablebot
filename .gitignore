@@ -19,4 +19,5 @@ debug_login.html
 timetablebot.db
 data/
 .DS_Store
+*results.json
 

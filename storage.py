@@ -443,3 +443,73 @@ def get_all_lms_users() -> list[int]:
     return user_ids
 
 
+# ---------------------------------------------------------------------------
+# Morning Timetable Cache (Persistent Multi-Tier Cache with MongoDB TTL)
+# ---------------------------------------------------------------------------
+_morning_cache_index_created = False
+
+def _ensure_morning_cache_index() -> None:
+    global _morning_cache_index_created
+    if not _morning_cache_index_created:
+        try:
+            _mongo_db.morning_cache.create_index("expires_at", expireAfterSeconds=0)
+            _morning_cache_index_created = True
+        except Exception as exc:
+            logger.warning("Could not create TTL index on morning_cache: %s", exc)
+
+
+def save_morning_cache(user_id: int, html_content: str, ttl_seconds: Optional[int] = None) -> None:
+    """Save pre-fetched timetable HTML in MongoDB morning_cache collection with TTL."""
+    _ensure_morning_cache_index()
+    uid = int(user_id)
+    if ttl_seconds is None:
+        ttl_seconds = getattr(config, "MORNING_CACHE_TTL_SECONDS", 14400)
+    now = datetime.now(timezone.utc)
+    expires_at = datetime.fromtimestamp(now.timestamp() + ttl_seconds, tz=timezone.utc)
+    try:
+        _mongo_db.morning_cache.update_one(
+            {"_id": uid},
+            {
+                "$set": {
+                    "html": html_content,
+                    "updated_at": now.isoformat(),
+                    "expires_at": expires_at,
+                }
+            },
+            upsert=True,
+        )
+    except Exception as exc:
+        logger.error("Error saving morning timetable cache for user %s: %s", uid, exc)
+
+
+def load_morning_cache(user_id: int) -> Optional[str]:
+    """Load cached timetable HTML from MongoDB morning_cache collection."""
+    uid = int(user_id)
+    try:
+        doc = _mongo_db.morning_cache.find_one({"_id": uid})
+        if not doc:
+            return None
+        expires_at = doc.get("expires_at")
+        if expires_at:
+            if isinstance(expires_at, datetime):
+                # Ensure expires_at is timezone-aware for comparison
+                exp = expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=timezone.utc)
+                if exp < datetime.now(timezone.utc):
+                    return None
+            elif isinstance(expires_at, (int, float)):
+                if expires_at < datetime.now(timezone.utc).timestamp():
+                    return None
+        return doc.get("html")
+    except Exception as exc:
+        logger.error("Error loading morning timetable cache for user %s: %s", uid, exc)
+        return None
+
+
+def clear_morning_cache() -> None:
+    """Clear all records from morning_cache collection."""
+    try:
+        _mongo_db.morning_cache.delete_many({})
+    except Exception as exc:
+        logger.error("Error clearing morning timetable cache: %s", exc)
+
+

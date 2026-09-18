@@ -77,4 +77,28 @@ MORNING_TIMETABLE_MINUTE = int(os.getenv("MORNING_TIMETABLE_MINUTE", "45"))
 # Paced with backoff and jitter to prevent hammering ERP servers.
 LOGIN_MAX_RETRIES = int(os.getenv("LOGIN_MAX_RETRIES", "6"))
 
+# --- Workload & Worker Concurrency ---
+OUTPASS_WORKERS = int(os.getenv("OUTPASS_WORKERS", "3"))
+TIMETABLE_WORKERS = int(os.getenv("TIMETABLE_WORKERS", "4"))
+LMS_WORKERS = int(os.getenv("LMS_WORKERS", "4"))
+PREFETCH_WORKERS = int(os.getenv("PREFETCH_WORKERS", "4"))
+TELEGRAM_DELIVERY_WORKERS = int(os.getenv("TELEGRAM_DELIVERY_WORKERS", "2"))
 
+# --- Global Backend Gates ---
+GLOBAL_ERP_MAX_CONCURRENCY = int(os.getenv("GLOBAL_ERP_MAX_CONCURRENCY", "5"))
+GLOBAL_ERP_MAX_RPS = float(os.getenv("GLOBAL_ERP_MAX_RPS", "5.0"))
+
+GLOBAL_LMS_MAX_CONCURRENCY = int(os.getenv("GLOBAL_LMS_MAX_CONCURRENCY", "8"))
+GLOBAL_LMS_MAX_RPS = float(os.getenv("GLOBAL_LMS_MAX_RPS", "8.0"))
+
+# --- Bounded Queue Sizes ---
+OUTPASS_QUEUE_MAXSIZE = int(os.getenv("OUTPASS_QUEUE_MAXSIZE", "200"))
+TIMETABLE_QUEUE_MAXSIZE = int(os.getenv("TIMETABLE_QUEUE_MAXSIZE", "500"))
+LMS_QUEUE_MAXSIZE = int(os.getenv("LMS_QUEUE_MAXSIZE", "500"))
+PREFETCH_QUEUE_MAXSIZE = int(os.getenv("PREFETCH_QUEUE_MAXSIZE", "2000"))
+
+# --- Telegram Outbox Throttling ---
+TELEGRAM_DELIVERY_MAX_RPS = float(os.getenv("TELEGRAM_DELIVERY_MAX_RPS", "20.0"))
+
+# --- Cache & TTL ---
+MORNING_CACHE_TTL_SECONDS = int(os.getenv("MORNING_CACHE_TTL_SECONDS", "14400"))  # 4 hours

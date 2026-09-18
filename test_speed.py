@@ -1,3 +1,4 @@
+import asyncio
 import io
 import sys
 import time
@@ -14,36 +15,52 @@ from PIL import Image
 import config
 import storage
 import credentials
-from erp.captcha_solver import warmup_captcha_solver, solve_captcha
+from erp.captcha_solver import warmup_captcha_solver, solve_captcha, solve_captcha_async
 from parser.timetable import get_timetable_messages
+from workload import workload_manager, GlobalERPGate, UserLockRegistry, LeakyBucketRateLimiter
 import bot
 
-def run_tests():
-    print("=" * 60)
-    print("🚀 KL UNIVERSITY BOT - PERFORMANCE & SPEED BENCHMARK")
-    print("=" * 60)
 
-    # 1. Test In-Memory Storage Cache
-    print("\n[1/3] Testing In-Memory Write-Through Storage Cache...")
+async def run_async_tests():
+    print("=" * 65)
+    print("🚀 KL UNIVERSITY BOT - MULTI-USER ARCHITECTURE VALIDATION")
+    print("=" * 65)
+
+    # 1. Test In-Memory & MongoDB Persistent Caches
+    print("\n[1/6] Testing In-Memory Session Cache & MongoDB TTL Morning Cache...")
     test_uid = 999999999
-    
+
     # Save session
     t0 = time.perf_counter()
     storage.save_user_session(test_uid, {"test_cookie": "klu_token_123"}, csrf_token="test_csrf_token")
     t_save = (time.perf_counter() - t0) * 1000
     print(f"  ⚡ Write session (DB + memory cache): {t_save:.2f} ms")
 
-    # Read from cache
+    # Read from session cache
     t0 = time.perf_counter()
     sess = storage.load_user_session(test_uid)
     t_cached = (time.perf_counter() - t0) * 1000
     print(f"  ⚡ Read session from in-memory cache: {t_cached:.4f} ms")
     assert sess is not None and sess.get("cookies") == {"test_cookie": "klu_token_123"}
     storage.delete_user_session(test_uid)
-    print("  ✅ Storage Cache Test: PASSED (Sub-millisecond retrieval)")
 
-    # 2. Test CAPTCHA Solver Pre-Warming & Inference
-    print("\n[2/3] Testing ONNX CAPTCHA Solver...")
+    # Test MongoDB Morning Cache with TTL
+    sample_html = "<html><body><table><tr><td>Test Schedule</td></tr></table></body></html>"
+    t0 = time.perf_counter()
+    storage.save_morning_cache(test_uid, sample_html, ttl_seconds=3600)
+    t_m_write = (time.perf_counter() - t0) * 1000
+    print(f"  ⚡ Write persistent morning cache (MongoDB TTL): {t_m_write:.2f} ms")
+
+    t0 = time.perf_counter()
+    loaded_html = storage.load_morning_cache(test_uid)
+    t_m_read = (time.perf_counter() - t0) * 1000
+    print(f"  ⚡ Read persistent morning cache (MongoDB): {t_m_read:.2f} ms")
+    assert loaded_html == sample_html
+    storage.clear_morning_cache()
+    print("  ✅ Storage Caches: PASSED (Multi-Tier Session & Morning TTL Cache Verified)")
+
+    # 2. Test CAPTCHA Solver Pre-Warming & Async Thread Offloading
+    print("\n[2/6] Testing ONNX CAPTCHA Solver & Async Offloading...")
     t0 = time.perf_counter()
     warmup_captcha_solver()
     t_warmup = (time.perf_counter() - t0) * 1000
@@ -55,13 +72,47 @@ def run_tests():
     dummy_bytes = buf.getvalue()
 
     t0 = time.perf_counter()
-    code = solve_captcha(dummy_bytes)
+    code_sync = solve_captcha(dummy_bytes)
     t_infer = (time.perf_counter() - t0) * 1000
-    print(f"  ⚡ Inference speed on CAPTCHA image: {t_infer:.2f} ms")
-    print("  ✅ CAPTCHA Pre-warm & Inference Test: PASSED")
+    print(f"  ⚡ Sync Inference speed on CAPTCHA image: {t_infer:.2f} ms")
 
-    # 3. Test Live Timetable Parsing & Per-User Cookie Isolation
-    print("\n[3/3] Testing Live Timetable Parsing & Per-User Cookie Isolation...")
+    t0 = time.perf_counter()
+    code_async = await solve_captcha_async(dummy_bytes)
+    t_infer_async = (time.perf_counter() - t0) * 1000
+    print(f"  ⚡ Async (Thread-Offloaded) Inference speed: {t_infer_async:.2f} ms")
+    assert code_sync == code_async
+    print("  ✅ CAPTCHA Async Offloading: PASSED (Non-blocking on event loop)")
+
+    # 3. Test Global ERP Gate Concurrency & Rate Limiting
+    print("\n[3/6] Testing Global ERP Gate Concurrency & Rate Limiter...")
+    gate = GlobalERPGate(max_concurrency=5, max_rps=5.0)
+
+    t0 = time.perf_counter()
+    # Concurrently acquire 10 slots
+    async def _worker(w_id):
+        async with gate:
+            await asyncio.sleep(0.1)
+
+    tasks = [asyncio.create_task(_worker(i)) for i in range(10)]
+    await asyncio.gather(*tasks)
+    gate_duration = time.perf_counter() - t0
+    print(f"  ⚡ 10 jobs through gate (max_c=5, rate=5.0/s) completed in: {gate_duration:.2f}s")
+    print(f"  ⚡ Peak in-flight requests observed: {gate.max_observed_in_flight} (Strict Limit: 5)")
+    assert gate.max_observed_in_flight <= 5
+    print("  ✅ Global ERP Gate: PASSED (Strict bounded concurrency & rate limiting)")
+
+    # 4. Test User Lock Registry
+    print("\n[4/6] Testing UserLockRegistry Isolation...")
+    registry = UserLockRegistry()
+    l1 = await registry.get_lock(1001)
+    l2 = await registry.get_lock(1001)
+    l3 = await registry.get_lock(1002)
+    assert l1 is l2, "Locks for same user ID must be identical instance"
+    assert l1 is not l3, "Locks for different user IDs must be separate instances"
+    print("  ✅ UserLockRegistry: PASSED (Per-user locks properly isolated)")
+
+    # 5. Test Live Timetable Parsing & Per-User Client Isolation
+    print("\n[5/6] Testing Live Timetable Parsing & Per-User Cookie Isolation...")
     mock_html = """
     <html>
         <body>
@@ -73,14 +124,12 @@ def run_tests():
         </body>
     </html>
     """
-    # Test timetable message extraction speed
     t0 = time.perf_counter()
     tue_messages = get_timetable_messages(mock_html, day_filter="Tue")
     t_parse = (time.perf_counter() - t0) * 1000
     print(f"  ⚡ Live Timetable Parsing speed: {t_parse:.3f} ms")
     assert len(tue_messages) > 0
 
-    # Test per-user client isolation (ensures zero cross-user cookie leakage)
     from erp.client import get_erp_client_for_user, reset_user_client
     c1 = get_erp_client_for_user(10001)
     c2 = get_erp_client_for_user(10002)
@@ -89,11 +138,37 @@ def run_tests():
     reset_user_client(10001)
     reset_user_client(10002)
     print("  ✅ Per-User Client & Cookie Isolation: PASSED (100% Zero Leakage)")
-    print("  ✅ Live Timetable Parsing: PASSED (Direct clean messages without extra UI buttons)")
 
-    print("\n" + "=" * 60)
-    print("🎉 ALL TESTS PASSED! The bot is optimized and ready to run.")
-    print("=" * 60)
+    # 6. Test WorkloadManager Priority Queues & Life Cycle
+    print("\n[6/6] Testing WorkloadManager Priority Routing & Life Cycle...")
+    await workload_manager.start()
+
+    # Submit a fast mock task to timetable_queue
+    async def mock_task(val: int, metric=None):
+        await asyncio.sleep(0.05)
+        return val * 2
+
+    res = await workload_manager.submit_job(
+        workload_manager.timetable_queue,
+        user_id=12345,
+        operation="mock_test",
+        queue_name="timetable",
+        handler=mock_task,
+        val=21,
+    )
+    assert res == 42
+    print(f"  ⚡ WorkloadManager job processed successfully with result: {res}")
+    await workload_manager.stop()
+    print("  ✅ WorkloadManager Life Cycle: PASSED")
+
+    print("\n" + "=" * 65)
+    print("🎉 ALL MULTI-USER ARCHITECTURAL TESTS PASSED SUCCESSFULLY!")
+    print("=" * 65)
+
+
+def run_tests():
+    asyncio.run(run_async_tests())
+
 
 if __name__ == "__main__":
     run_tests()

@@ -163,13 +163,19 @@ class UserConcurrencyManager:
 
 class BackendThrottle:
     """
-    Global semaphores for college ERP and LMS endpoints.
-    Protects the bot's server IP from triggering university firewall/WAF bans.
+    Global gates for college ERP and LMS endpoints.
+    Delegates to workload_manager.erp_gate and workload_manager.lms_gate
+    which combine concurrency semaphores with token/leaky-bucket rate limiters.
     """
+    @property
+    def erp_semaphore(self):
+        from workload import workload_manager
+        return workload_manager.erp_gate
 
-    def __init__(self):
-        self.erp_semaphore = asyncio.Semaphore(MAX_CONCURRENT_ERP_REQUESTS)
-        self.lms_semaphore = asyncio.Semaphore(MAX_CONCURRENT_LMS_REQUESTS)
+    @property
+    def lms_semaphore(self):
+        from workload import workload_manager
+        return workload_manager.lms_gate
 
 
 class BruteForceTracker:

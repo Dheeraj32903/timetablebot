@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 import httpx
 
 import config
-from erp.captcha_solver import solve_captcha
+from erp.captcha_solver import solve_captcha, solve_captcha_async
 from security import backend_throttle
 
 # We use verify=False because the reference backend does, and some university ERP
@@ -238,7 +238,7 @@ async def auto_login(username: str, password: str, user_id: Optional[int] = None
         cookies = _collect_cookies(captcha_res, cookies)
 
         captcha_bytes = captcha_res.content
-        captcha_code = solve_captcha(captcha_bytes)
+        captcha_code = await solve_captcha_async(captcha_bytes)
 
         # Step 4: Submit credentials + solved CAPTCHA.
         submit_headers = dict(headers)

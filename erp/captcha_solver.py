@@ -64,3 +64,12 @@ def solve_captcha(image_bytes: bytes) -> str:
         last = best
 
     return "".join(out)
+
+
+async def solve_captcha_async(image_bytes: bytes) -> str:
+    """
+    Asynchronously solve a KL ERP image CAPTCHA offloaded to a worker thread.
+    Keeps the asyncio event loop 100% responsive.
+    """
+    import asyncio
+    return await asyncio.to_thread(solve_captcha, image_bytes)

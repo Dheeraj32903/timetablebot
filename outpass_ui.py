@@ -10,6 +10,7 @@ import erp.outpass as outpass_api
 from calendar_ui import create_calendar, parse_calendar_callback
 from erp.session import load_session
 from security import user_concurrency
+from workload import workload_manager
 
 logger = logging.getLogger(__name__)
 
@@ -616,7 +617,12 @@ async def handle_outpass_callback(update: Update, context: ContextTypes.DEFAULT_
             saved = credentials.load_user_credentials(uid)
             sess = load_session(user_id=uid)
             if saved and sess and sess.get("cookies"):
-                success, msg = await outpass_api.submit_local_outpass(
+                success, msg = await workload_manager.submit_job(
+                    workload_manager.outpass_queue,
+                    uid,
+                    "submit_local_outpass",
+                    "outpass",
+                    outpass_api.submit_local_outpass,
                     date=date_str,
                     out_time=out_time,
                     in_time=in_time,
@@ -694,7 +700,12 @@ async def handle_outpass_callback(update: Update, context: ContextTypes.DEFAULT_
             saved = credentials.load_user_credentials(uid)
             sess = load_session(user_id=uid)
             if saved and sess and sess.get("cookies"):
-                success, msg = await outpass_api.submit_home_outpass(
+                success, msg = await workload_manager.submit_job(
+                    workload_manager.outpass_queue,
+                    uid,
+                    "submit_home_outpass",
+                    "outpass",
+                    outpass_api.submit_home_outpass,
                     out_datetime=out_dt,
                     in_datetime=in_dt,
                     reason=reason,
