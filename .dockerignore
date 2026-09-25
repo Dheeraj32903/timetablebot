@@ -18,3 +18,7 @@ timetablebot.db
 data/
 scratch/
 .DS_Store
+*results.json
+*.bak
+*.backup
+*backup*.py

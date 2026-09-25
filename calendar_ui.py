@@ -1,7 +1,13 @@
 import calendar
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional, Tuple
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+try:
+    from zoneinfo import ZoneInfo
+    IST = ZoneInfo("Asia/Kolkata")
+except Exception:
+    IST = timezone(timedelta(hours=5, minutes=30))
 
 
 MONTH_NAMES = [
@@ -19,8 +25,9 @@ def create_calendar(
 ) -> InlineKeyboardMarkup:
     """
     Generate an aesthetic Telegram inline keyboard calendar for the given year and month.
+    Uses IST (Indian Standard Time) to prevent server timezone mismatch.
     """
-    now = datetime.now()
+    now = datetime.now(IST)
     if year is None:
         year = now.year
     if month is None:

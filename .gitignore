@@ -20,4 +20,6 @@ timetablebot.db
 data/
 .DS_Store
 *results.json
-
+*.bak
+*.backup
+*backup*.py

@@ -1,4 +1,5 @@
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -33,8 +34,22 @@ try:
         mongo_kwargs["tlsCAFile"] = ca_file
 
     _mongo_client = MongoClient(config.MONGODB_URI, **mongo_kwargs)
-    # Test connection
-    _mongo_client.admin.command("ping")
+    # Test connection with retries for cold start / serverless wakeups
+    connected = False
+    last_exc = None
+    for attempt in range(1, 4):
+        try:
+            _mongo_client.admin.command("ping")
+            connected = True
+            break
+        except Exception as exc:
+            last_exc = exc
+            logger.warning("MongoDB ping attempt %d/3 failed: %s", attempt, exc)
+            time.sleep(1.5)
+    if not connected:
+        logger.critical("Failed to connect to MongoDB after 3 attempts: %s", last_exc)
+        raise RuntimeError(f"MongoDB connection failed: {last_exc}")
+
     _mongo_db = _mongo_client[config.MONGODB_DB_NAME]
     logger.info("Successfully connected to MongoDB database '%s'", config.MONGODB_DB_NAME)
 except Exception as exc:

@@ -130,7 +130,12 @@ class GlobalERPGate:
     async def acquire(self) -> float:
         t0 = time.perf_counter()
         await self._semaphore.acquire()
-        await self._rate_limiter.acquire()
+        try:
+            await self._rate_limiter.acquire()
+        except BaseException:
+            self._semaphore.release()
+            raise
+
         gate_wait_ms = (time.perf_counter() - t0) * 1000.0
 
         async with self._lock:
@@ -163,7 +168,11 @@ class GlobalLMSGate:
     async def acquire(self) -> float:
         t0 = time.perf_counter()
         await self._semaphore.acquire()
-        await self._rate_limiter.acquire()
+        try:
+            await self._rate_limiter.acquire()
+        except BaseException:
+            self._semaphore.release()
+            raise
         self.current_in_flight += 1
         return (time.perf_counter() - t0) * 1000.0
 
@@ -191,9 +200,24 @@ class UserLockRegistry:
     async def get_lock(self, user_id: int) -> asyncio.Lock:
         uid = int(user_id)
         async with self._registry_lock:
+            # Auto-prune unheld locks when registry grows large
+            if len(self._locks) > 200:
+                self._prune_unlocked_internal()
             if uid not in self._locks:
                 self._locks[uid] = asyncio.Lock()
             return self._locks[uid]
+
+    def _prune_unlocked_internal(self) -> None:
+        """Internal prune called while _registry_lock is held."""
+        to_del = [uid for uid, lock in self._locks.items() if not lock.locked()]
+        for uid in to_del:
+            self._locks.pop(uid, None)
+
+    async def cleanup_idle_locks(self) -> None:
+        """Periodic background sweep for idle unlocked user locks."""
+        async with self._registry_lock:
+            self._prune_unlocked_internal()
+
 
 
 # ---------------------------------------------------------------------------

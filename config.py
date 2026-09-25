@@ -55,6 +55,9 @@ ERP_TIMETABLE_REFERER_URL = os.getenv(
     "https://newerp.kluniversity.in/index.php?r=timetables%2Funiversitymasteracademictimetableview%2Findexstudentindisearch",
 )
 
+ERP_ACADEMIC_YEAR = os.getenv("ERP_ACADEMIC_YEAR", "").strip()
+ERP_SEMESTER_ID = os.getenv("ERP_SEMESTER_ID", "").strip()
+
 ERP_USER_AGENT = os.getenv(
     "ERP_USER_AGENT",
     "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Mobile Safari/537.36",

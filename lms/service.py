@@ -1,4 +1,5 @@
 import asyncio
+import html as html_lib
 import logging
 import re
 import time
@@ -331,23 +332,23 @@ class LMSService:
         return sorted_tasks
 
     @staticmethod
-    def format_tasks_telegram_message(tasks: list[LMSTask], student_name: str = "") -> str:
-        """Format pending tasks grouped by subject with clean divider lines between tasks and subjects."""
-        greeting = f"<b>{student_name}</b>, here" if student_name else "Here"
+    def get_tasks_telegram_messages(tasks: list[LMSTask], student_name: str = "", max_length: int = 3800) -> list[str]:
+        """Format pending tasks partitioned into message chunks <= max_length to prevent 4096 char errors."""
+        name_clean = html_lib.escape(student_name) if student_name else ""
+        greeting = f"<b>{name_clean}</b>, here" if name_clean else "Here"
 
         if not tasks:
-            return (
+            return [(
                 "<b>All Caught Up</b>\n\n"
                 f"{greeting} are no pending HAs, ALMs, or quizzes right now.\n"
                 "All your university submissions are up to date."
-            )
+            )]
 
         from collections import defaultdict
         grouped = defaultdict(list)
         for t in tasks:
             grouped[t.course_name].append(t)
 
-        # Sort courses by the earliest task due timestamp (urgent subjects first)
         sorted_courses = sorted(
             grouped.keys(),
             key=lambda c: min(t.due_timestamp for t in grouped[c] if t.due_timestamp > 0)
@@ -358,11 +359,16 @@ class LMSService:
         subject_cards = []
         for course in sorted_courses:
             c_tasks = grouped[course]
-            card_lines = [f"<b>{course}</b>"]
+            c_escaped = html_lib.escape(course)
+            card_lines = [f"<b>{c_escaped}</b>"]
 
             for t in c_tasks:
-                link_title = f"<a href=\"{t.url}\">{t.title}</a>" if t.url else t.title
-                type_label = f" ({t.task_type})" if (t.task_type and t.task_type.lower() not in t.title.lower()) else ""
+                t_title = html_lib.escape(t.title)
+                t_type = html_lib.escape(t.task_type)
+                t_url = html_lib.escape(t.url) if t.url else ""
+
+                link_title = f'<a href="{t_url}">{t_title}</a>' if t_url else t_title
+                type_label = f" ({t_type})" if (t_type and t_type.lower() not in t_title.lower()) else ""
 
                 if t.urgency == "overdue":
                     card_lines.append(f"• {link_title}{type_label}\n  <i>{t.time_left_str}</i>")
@@ -372,20 +378,44 @@ class LMSService:
             card_content = "\n".join(card_lines)
             subject_cards.append(f"<blockquote>{card_content}</blockquote>")
 
-        cards_text = "\n".join(subject_cards)
-        return (
-            f"<b>KL LMS Pending Tasks ({len(tasks)})</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"{cards_text}\n\n"
-            "<i>Click any task name to open the LMS submission page.</i>"
-        )
+        header = f"<b>KL LMS Pending Tasks ({len(tasks)})</b>\n━━━━━━━━━━━━━━━━━━━━━━\n"
+        footer = "\n\n<i>Click any task name to open the LMS submission page.</i>"
+
+        messages = []
+        current_chunk = []
+        current_len = len(header) + len(footer)
+
+        for card in subject_cards:
+            card_len = len(card) + 1
+            if current_chunk and current_len + card_len > max_length:
+                messages.append(header + "\n".join(current_chunk) + footer)
+                current_chunk = [card]
+                current_len = len(header) + len(footer) + card_len
+            else:
+                current_chunk.append(card)
+                current_len += card_len
+
+        if current_chunk:
+            messages.append(header + "\n".join(current_chunk) + footer)
+
+        return messages
+
+    @staticmethod
+    def format_tasks_telegram_message(tasks: list[LMSTask], student_name: str = "") -> str:
+        """Format pending tasks grouped by subject. Returns the primary formatted message."""
+        messages = LMSService.get_tasks_telegram_messages(tasks, student_name=student_name)
+        return messages[0] if messages else "<b>All Caught Up</b>"
 
     @staticmethod
     def format_new_task_alert(task: LMSTask) -> str:
         """Professional alert when a new assignment is posted with blockquote card styling."""
-        c_name = clean_course_name(task.course_name)
-        link_title = f"<a href=\"{task.url}\">{task.title}</a>" if task.url else task.title
-        type_label = f" ({task.task_type})" if (task.task_type and task.task_type.lower() not in task.title.lower()) else ""
+        c_name = html_lib.escape(clean_course_name(task.course_name))
+        t_title = html_lib.escape(task.title)
+        t_type = html_lib.escape(task.task_type)
+        t_url = html_lib.escape(task.url) if task.url else ""
+
+        link_title = f'<a href="{t_url}">{t_title}</a>' if t_url else t_title
+        type_label = f" ({t_type})" if (t_type and t_type.lower() not in t_title.lower()) else ""
 
         card_content = (
             f"<b>{c_name}</b>\n"
@@ -402,9 +432,13 @@ class LMSService:
     @staticmethod
     def format_2day_reminder_alert(task: LMSTask) -> str:
         """Professional 48-hour deadline reminder with blockquote card styling."""
-        c_name = clean_course_name(task.course_name)
-        link_title = f"<a href=\"{task.url}\">{task.title}</a>" if task.url else task.title
-        type_label = f" ({task.task_type})" if (task.task_type and task.task_type.lower() not in task.title.lower()) else ""
+        c_name = html_lib.escape(clean_course_name(task.course_name))
+        t_title = html_lib.escape(task.title)
+        t_type = html_lib.escape(task.task_type)
+        t_url = html_lib.escape(task.url) if task.url else ""
+
+        link_title = f'<a href="{t_url}">{t_title}</a>' if t_url else t_title
+        type_label = f" ({t_type})" if (t_type and t_type.lower() not in t_title.lower()) else ""
 
         card_content = (
             f"<b>{c_name}</b>\n"
@@ -421,9 +455,13 @@ class LMSService:
     @staticmethod
     def format_urgent_reminder_alert(task: LMSTask) -> str:
         """Professional same-day closing alert with blockquote card styling."""
-        c_name = clean_course_name(task.course_name)
-        link_title = f"<a href=\"{task.url}\">{task.title}</a>" if task.url else task.title
-        type_label = f" ({task.task_type})" if (task.task_type and task.task_type.lower() not in task.title.lower()) else ""
+        c_name = html_lib.escape(clean_course_name(task.course_name))
+        t_title = html_lib.escape(task.title)
+        t_type = html_lib.escape(task.task_type)
+        t_url = html_lib.escape(task.url) if task.url else ""
+
+        link_title = f'<a href="{t_url}">{t_title}</a>' if t_url else t_title
+        type_label = f" ({t_type})" if (t_type and t_type.lower() not in t_title.lower()) else ""
 
         card_content = (
             f"<b>{c_name}</b>\n"

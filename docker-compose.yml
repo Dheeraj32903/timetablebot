@@ -8,9 +8,6 @@ services:
     env_file:
       - .env
     volumes:
-      # Persist local database, encrypted credentials, and keys across container rebuilds
+      # Persist local data directory across container rebuilds
       - ./data:/app/data
-      - ./credentials.json:/app/credentials.json
-      - ./.secret.key:/app/.secret.key
-      - ./.morning_enabled:/app/.morning_enabled
 

@@ -81,15 +81,18 @@ def _encrypt_val(value: str) -> str:
     return cipher.encrypt(value.encode("utf-8")).decode("utf-8")
 
 
-def _decrypt_val(value: str) -> str:
-    """Decrypt a ciphertext string, or return raw value if unencrypted."""
-    if not value or not _is_fernet_token(value):
+def _decrypt_val(value: str) -> Optional[str]:
+    """Decrypt a ciphertext string, or return raw value if unencrypted. Returns None on decrypt failure."""
+    if not value:
+        return ""
+    if not _is_fernet_token(value):
         return value
     cipher = _get_fernet()
     try:
         return cipher.decrypt(value.encode("utf-8")).decode("utf-8")
-    except (InvalidToken, Exception):
-        return value
+    except (InvalidToken, Exception) as exc:
+        logger.warning("Fernet decryption failed (key mismatch or corruption): %s", exc)
+        return None
 
 
 def save_user_credentials(telegram_user_id: int, username: str, password: str) -> None:
@@ -105,10 +108,15 @@ def load_user_credentials(telegram_user_id: int) -> Optional[dict]:
     """Load and decrypt stored ERP credentials for a Telegram user from MongoDB/storage."""
     record = storage.load_user_credentials(telegram_user_id)
     if record:
-        return {
-            "username": _decrypt_val(record["username"]),
-            "password": _decrypt_val(record["password"]),
-        }
+        u = _decrypt_val(record.get("username", ""))
+        p = _decrypt_val(record.get("password", ""))
+        if u and p:
+            return {
+                "username": u,
+                "password": p,
+            }
+        logger.warning("Stored ERP credentials for user %s could not be decrypted.", telegram_user_id)
+        return None
 
     # Fallback to ERP_USERNAME and ERP_PASSWORD from .env if configured
     if config.ERP_USERNAME and config.ERP_PASSWORD:
@@ -131,10 +139,13 @@ def all_user_credentials() -> dict:
     result = {}
     for user_id_str, record in raw_users.items():
         if record.get("username") and record.get("password"):
-            result[user_id_str] = {
-                "username": _decrypt_val(record["username"]),
-                "password": _decrypt_val(record["password"]),
-            }
+            u = _decrypt_val(record["username"])
+            p = _decrypt_val(record["password"])
+            if u and p:
+                result[user_id_str] = {
+                    "username": u,
+                    "password": p,
+                }
     return result
 
 
@@ -149,10 +160,15 @@ def load_user_lms_credentials(telegram_user_id: int) -> Optional[dict]:
     """Load and decrypt stored LMS credentials for a Telegram user."""
     record = storage.load_user_lms_credentials(telegram_user_id)
     if record:
-        return {
-            "username": _decrypt_val(record["username"]),
-            "password": _decrypt_val(record["password"]),
-        }
+        u = _decrypt_val(record.get("username", ""))
+        p = _decrypt_val(record.get("password", ""))
+        if u and p:
+            return {
+                "username": u,
+                "password": p,
+            }
+        logger.warning("Stored LMS credentials for user %s could not be decrypted.", telegram_user_id)
+        return None
     return None
 
 

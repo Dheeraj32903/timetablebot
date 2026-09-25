@@ -1,3 +1,4 @@
+import html as html_lib
 import logging
 from datetime import datetime, date, timedelta
 from typing import Optional
@@ -134,17 +135,17 @@ def format_outpass_history_message(outpasses: list) -> str:
     msg = [
         "🏠 <b>Hostel Outpass Status</b>",
         "━━━━━━━━━━━━━━━━━━━",
-        f"🎫 <b>Request #{latest.get('id', 'N/A')}</b>",
+        f"🎫 <b>Request #{html_lib.escape(str(latest.get('id', 'N/A')))}</b>",
         f"📅 <b>Outing Date:</b> <code>{_friendly_date(latest.get('outing_date', 'N/A'))}</code>",
         f"📌 <b>Status:</b> {badge}",
         f"🛫 <b>Out Date & Time:</b> <code>{out_t}</code>",
         f"🛬 <b>In Date & Time:</b> <code>{in_t}</code>",
-        f"📝 <b>Reason:</b> <i>{latest.get('reason', 'N/A')}</i>",
-        f"👮 <b>Warden:</b> {latest.get('warden_name', 'N/A')}",
+        f"📝 <b>Reason:</b> <i>{html_lib.escape(str(latest.get('reason', 'N/A')))}</i>",
+        f"👮 <b>Warden:</b> {html_lib.escape(str(latest.get('warden_name', 'N/A')))}",
     ]
 
     if latest.get("approved_by") and latest.get("approved_by") != "N/A":
-        msg.append(f"✍️ <b>Approved By:</b> <code>{latest.get('approved_by')}</code>")
+        msg.append(f"✍️ <b>Approved By:</b> <code>{html_lib.escape(str(latest.get('approved_by')))}</code>")
 
     return "\n".join(msg)
 
@@ -528,6 +529,23 @@ async def handle_outpass_callback(update: Update, context: ContextTypes.DEFAULT_
             return
 
         if step == "home_in":
+            out_date = flow.get("out_date", "")
+            in_date = flow.get("in_date", "")
+            out_time = flow.get("out_time", "00:00:00")
+            if in_date == out_date and time_str <= out_time:
+                try:
+                    await query.answer("⚠️ Return time must be after departure time on the same day!", show_alert=True)
+                except Exception:
+                    pass
+                await query.edit_message_text(
+                    f"⚠️ <b>Invalid Return Time</b>\n\n"
+                    f"On the same departure day (<code>{_friendly_date(in_date)}</code>), Return Time (<code>{_format_time_friendly(time_str)}</code>) must be later than Out Time (<code>{_format_time_friendly(out_time)}</code>).\n\n"
+                    f"⏰ <b>Please select a valid Return Hour:</b>",
+                    parse_mode="HTML",
+                    reply_markup=create_hour_picker("home_in", in_date),
+                )
+                return
+
             flow["in_time"] = time_str
             context.user_data["login_state"] = STATE_WAITING_OUTPASS_REASON
             buttons = [[InlineKeyboardButton("❌ Cancel Outpass", callback_data="outpass:cancel")]]
@@ -556,6 +574,24 @@ async def handle_outpass_callback(update: Update, context: ContextTypes.DEFAULT_
             return
 
         if step == "loc_in":
+            out_time = flow.get("out_time", "00:00:00")
+            if time_str <= out_time:
+                date_str = flow.get("date", "")
+                try:
+                    await query.answer("⚠️ Return time must be after departure time!", show_alert=True)
+                except Exception:
+                    pass
+                await query.edit_message_text(
+                    f"⚠️ <b>Invalid Return Time</b>\n\n"
+                    f"Return time (<code>{_format_time_friendly(time_str)}</code>) cannot be earlier than or equal to departure time (<code>{_format_time_friendly(out_time)}</code>).\n\n"
+                    f"📅 Date: <b>{_friendly_date(date_str)}</b>\n"
+                    f"⏰ Out Time: <b>{_format_time_friendly(out_time)}</b>\n\n"
+                    f"🕐 <b>Please select a valid Return Hour:</b>",
+                    parse_mode="HTML",
+                    reply_markup=create_hour_picker("loc_in", date_str),
+                )
+                return
+
             flow["in_time"] = time_str
             await _show_meals_keyboard(query, flow)
             return
@@ -601,7 +637,10 @@ async def handle_outpass_callback(update: Update, context: ContextTypes.DEFAULT_
 
         async with user_concurrency.task_guard(uid) as acquired:
             if not acquired:
-                await query.answer("⏳ Outpass submission in progress. Please wait...", show_alert=True)
+                try:
+                    await query.answer("⏳ Outpass submission in progress. Please wait...", show_alert=True)
+                except Exception:
+                    pass
                 return
 
             # Pop flow immediately to prevent any race conditions or double submissions
@@ -616,35 +655,39 @@ async def handle_outpass_callback(update: Update, context: ContextTypes.DEFAULT_
 
             saved = credentials.load_user_credentials(uid)
             sess = load_session(user_id=uid)
-            if saved and sess and sess.get("cookies"):
-                success, msg = await workload_manager.submit_job(
-                    workload_manager.outpass_queue,
-                    uid,
-                    "submit_local_outpass",
-                    "outpass",
-                    outpass_api.submit_local_outpass,
-                    date=date_str,
-                    out_time=out_time,
-                    in_time=in_time,
-                    reason=reason,
-                    meals=meals,
-                    user_id=uid,
-                )
-            else:
-                import random
-                test_id = str(random.randint(40000, 49999))
-                _test_outpass_store[uid] = [{
-                    "id": test_id,
-                    "student_id": str(uid),
-                    "outing_date": date_str,
-                    "out_time": f"{date_str} {out_time}",
-                    "in_time": f"{date_str} {in_time}",
-                    "reason": reason,
-                    "warden_name": "Dr. K. Srinivas (Chief Warden)",
-                    "status": "Approved",
-                    "approved_by": "Dr. K. Srinivas (Chief Warden)",
-                }]
-                success, msg = True, "Simulated in Test Mode"
+            try:
+                if saved and sess and sess.get("cookies"):
+                    success, msg = await workload_manager.submit_job(
+                        workload_manager.outpass_queue,
+                        uid,
+                        "submit_local_outpass",
+                        "outpass",
+                        outpass_api.submit_local_outpass,
+                        date=date_str,
+                        out_time=out_time,
+                        in_time=in_time,
+                        reason=reason,
+                        meals=meals,
+                        user_id=uid,
+                    )
+                else:
+                    import random
+                    test_id = str(random.randint(40000, 49999))
+                    _test_outpass_store[uid] = [{
+                        "id": test_id,
+                        "student_id": str(uid),
+                        "outing_date": date_str,
+                        "out_time": f"{date_str} {out_time}",
+                        "in_time": f"{date_str} {in_time}",
+                        "reason": reason,
+                        "warden_name": "Dr. K. Srinivas (Chief Warden)",
+                        "status": "Approved",
+                        "approved_by": "Dr. K. Srinivas (Chief Warden)",
+                    }]
+                    success, msg = True, "Simulated in Test Mode"
+            except Exception as exc:
+                logger.error("Error submitting local outpass: %s", exc)
+                success, msg = False, f"Server error: {str(exc)}"
 
             if success:
                 outpasses = []
@@ -676,7 +719,7 @@ async def handle_outpass_callback(update: Update, context: ContextTypes.DEFAULT_
                     reply_markup=InlineKeyboardMarkup(buttons),
                 )
             else:
-                await query.edit_message_text(f"❌ <b>Outpass Failed:</b>\n{msg}", parse_mode="HTML")
+                await query.edit_message_text(f"❌ <b>Outpass Failed:</b>\n{html_lib.escape(msg)}", parse_mode="HTML")
             return
 
     if data == "outpass:confirm_home":
@@ -686,7 +729,10 @@ async def handle_outpass_callback(update: Update, context: ContextTypes.DEFAULT_
 
         async with user_concurrency.task_guard(uid) as acquired:
             if not acquired:
-                await query.answer("⏳ Outpass submission in progress. Please wait...", show_alert=True)
+                try:
+                    await query.answer("⏳ Outpass submission in progress. Please wait...", show_alert=True)
+                except Exception:
+                    pass
                 return
 
             # Pop flow immediately to prevent any race conditions or double submissions
@@ -699,33 +745,37 @@ async def handle_outpass_callback(update: Update, context: ContextTypes.DEFAULT_
 
             saved = credentials.load_user_credentials(uid)
             sess = load_session(user_id=uid)
-            if saved and sess and sess.get("cookies"):
-                success, msg = await workload_manager.submit_job(
-                    workload_manager.outpass_queue,
-                    uid,
-                    "submit_home_outpass",
-                    "outpass",
-                    outpass_api.submit_home_outpass,
-                    out_datetime=out_dt,
-                    in_datetime=in_dt,
-                    reason=reason,
-                    user_id=uid,
-                )
-            else:
-                import random
-                test_id = str(random.randint(50000, 59999))
-                _test_outpass_store[uid] = [{
-                    "id": test_id,
-                    "student_id": str(uid),
-                    "outing_date": flow.get('out_date'),
-                    "out_time": out_dt,
-                    "in_time": in_dt,
-                    "reason": reason,
-                    "warden_name": "Dr. K. Srinivas (Chief Warden)",
-                    "status": "Approved",
-                    "approved_by": "Dr. K. Srinivas (Chief Warden)",
-                }]
-                success, msg = True, "Simulated in Test Mode"
+            try:
+                if saved and sess and sess.get("cookies"):
+                    success, msg = await workload_manager.submit_job(
+                        workload_manager.outpass_queue,
+                        uid,
+                        "submit_home_outpass",
+                        "outpass",
+                        outpass_api.submit_home_outpass,
+                        out_datetime=out_dt,
+                        in_datetime=in_dt,
+                        reason=reason,
+                        user_id=uid,
+                    )
+                else:
+                    import random
+                    test_id = str(random.randint(50000, 59999))
+                    _test_outpass_store[uid] = [{
+                        "id": test_id,
+                        "student_id": str(uid),
+                        "outing_date": flow.get('out_date'),
+                        "out_time": out_dt,
+                        "in_time": in_dt,
+                        "reason": reason,
+                        "warden_name": "Dr. K. Srinivas (Chief Warden)",
+                        "status": "Approved",
+                        "approved_by": "Dr. K. Srinivas (Chief Warden)",
+                    }]
+                    success, msg = True, "Simulated in Test Mode"
+            except Exception as exc:
+                logger.error("Error submitting home outpass: %s", exc)
+                success, msg = False, f"Server error: {str(exc)}"
 
             if success:
                 outpasses = []
@@ -757,7 +807,7 @@ async def handle_outpass_callback(update: Update, context: ContextTypes.DEFAULT_
                     reply_markup=InlineKeyboardMarkup(buttons),
                 )
             else:
-                await query.edit_message_text(f"❌ <b>Outpass Failed:</b>\n{msg}", parse_mode="HTML")
+                await query.edit_message_text(f"❌ <b>Outpass Failed:</b>\n{html_lib.escape(msg)}", parse_mode="HTML")
             return
 
 
@@ -800,9 +850,10 @@ async def _show_meals_keyboard(query, flow: dict, is_edit_markup_only: bool = Fa
 
 async def _show_confirmation_review(message, flow: dict) -> None:
     op_type = flow.get("type", "days")
+    reason_escaped = html_lib.escape(str(flow.get("reason", "Outing")))
     if op_type == "hours":
         meals = flow.get("meals", {})
-        meals_str = f"Breakfast: {meals.get('breakfast')}, Lunch: {meals.get('lunch')}, Dinner: {meals.get('dinner')}"
+        meals_str = f"Breakfast: {meals.get('breakfast', 'NO')}, Lunch: {meals.get('lunch', 'NO')}, Snack: {meals.get('snack', 'NO')}, Dinner: {meals.get('dinner', 'NO')}"
         text = (
             "🏠 <b>Review Outpass Application</b>\n"
             "━━━━━━━━━━━━━━━━━━━\n"
@@ -810,7 +861,7 @@ async def _show_confirmation_review(message, flow: dict) -> None:
             f"• <b>Date:</b> <code>{_friendly_date(flow.get('date', ''))}</code>\n"
             f"• <b>Out Date & Time:</b> <code>{_friendly_date(flow.get('date', ''))} {_format_time_friendly(flow.get('out_time'))}</code>\n"
             f"• <b>In Date & Time:</b> <code>{_friendly_date(flow.get('date', ''))} {_format_time_friendly(flow.get('in_time'))}</code>\n"
-            f"• <b>Reason:</b> <i>{flow.get('reason')}</i>\n"
+            f"• <b>Reason:</b> <i>{reason_escaped}</i>\n"
             f"• <b>Mess:</b> {meals_str}\n\n"
             "⚠️ <b>Note:</b> Your outpass is <b>NOT</b> applied yet.\n"
             "👉 Press <b>Submit Outpass</b> below to officially apply:"
@@ -826,7 +877,7 @@ async def _show_confirmation_review(message, flow: dict) -> None:
             "• <b>Category:</b> 🏡 Home Outing (Days)\n"
             f"• <b>Out Date & Time:</b> <code>{_friendly_date(flow.get('out_date', ''))} {_format_time_friendly(flow.get('out_time'))}</code>\n"
             f"• <b>In Date & Time:</b> <code>{_friendly_date(flow.get('in_date', ''))} {_format_time_friendly(flow.get('in_time'))}</code>\n"
-            f"• <b>Reason:</b> <i>{flow.get('reason')}</i>\n\n"
+            f"• <b>Reason:</b> <i>{reason_escaped}</i>\n\n"
             "⚠️ <b>Note:</b> Your outpass is <b>NOT</b> applied yet.\n"
             "👉 Press <b>Submit Outpass</b> below to officially apply:"
         )

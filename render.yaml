@@ -20,6 +20,10 @@ services:
         value: "7"
       - key: MORNING_TIMETABLE_MINUTE
         value: "0"
+      - key: ERP_ACADEMIC_YEAR
+        value: "29"
+      - key: ERP_SEMESTER_ID
+        value: "1"
 
 
 

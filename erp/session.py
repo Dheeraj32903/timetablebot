@@ -128,16 +128,16 @@ async def fetch_timetable_html(
         cookies = session.get("cookies", {})
         csrf_token = session.get("csrf_token", "")
 
-    # Extract academic year and semester from the configured timetable URL.
+    # Extract academic year and semester from config or the configured timetable URL.
     # Defaults are 29 and 1 if parsing fails.
-    academic_year_code = "29"
-    semester_id = "1"
+    academic_year_code = config.ERP_ACADEMIC_YEAR or "29"
+    semester_id = config.ERP_SEMESTER_ID or "1"
     url = config.ERP_TIMETABLE_URL
-    if "academicyear%5D=" in url:
+    if not config.ERP_ACADEMIC_YEAR and "academicyear%5D=" in url:
         match = re.search(r"academicyear%5D=(\d+)", url)
         if match:
             academic_year_code = match.group(1)
-    if "semesterid%5D=" in url:
+    if not config.ERP_SEMESTER_ID and "semesterid%5D=" in url:
         match = re.search(r"semesterid%5D=(\d+)", url)
         if match:
             semester_id = match.group(1)

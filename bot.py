@@ -1,4 +1,5 @@
 import asyncio
+import html as html_lib
 import logging
 import random
 import time
@@ -64,7 +65,7 @@ STATE_WAITING_PASSWORD = "waiting_password"
 STATE_WAITING_LMS_USERNAME = "waiting_lms_username"
 STATE_WAITING_LMS_PASSWORD = "waiting_lms_password"
 
-BOT_VERSION = "5.3.0"
+BOT_VERSION = "5.3.1"
 
 # Daily automatic timetable message job names.
 MORNING_TIMETABLE_JOB_NAME = "morning_timetable"
@@ -102,6 +103,7 @@ BOT_COMMANDS = [
     BotCommand("week", "Full weekly timetable view"),
     BotCommand("submissions", "Pending assignments & LMS deadlines"),
     BotCommand("outpass", "Hostel outpass records & live status"),
+    BotCommand("friend", "Lookup classmate's timetable"),
     BotCommand("login", "Connect & save ERP credentials"),
     BotCommand("lms_login", "Connect & save LMS credentials"),
     BotCommand("lms_logout", "Disconnect LMS credentials"),
@@ -213,6 +215,67 @@ async def _run_login(update: Update, username: str, password: str) -> None:
             )
 
 
+async def _run_friend_login(update: Update, username: str, password: str) -> None:
+    """Run ephemeral login to fetch a friend's timetable without touching stored user sessions."""
+    user = update.effective_user
+    uid = user.id if user else 0
+    msg = await update.message.reply_text("⏳ <i>Logging in and fetching friend's timetable...</i>", parse_mode="HTML")
+    try:
+        async def _friend_fetch():
+            login_res = await auto_login(username, password)
+            cookies = login_res["cookies"]
+            csrf = login_res.get("csrf_token", "")
+            return await fetch_timetable_html(cookies=cookies, csrf_token=csrf)
+
+        html = await workload_manager.submit_job(
+            workload_manager.timetable_queue,
+            uid,
+            "fetch_friend_timetable",
+            "timetable",
+            _friend_fetch,
+        )
+
+        today_name = _today_day_name()
+        messages = get_timetable_messages(html, day_filter=today_name)
+        if not messages:
+            await msg.edit_text("⚠️ <i>Could not extract friend's timetable.</i>", parse_mode="HTML")
+            return
+
+        u_escaped = html_lib.escape(username)
+        await msg.edit_text(
+            f"👥 <b>Timetable for {u_escaped} ({today_name}):</b>\n\n{messages[0]}",
+            parse_mode="HTML",
+        )
+        for extra in messages[1:]:
+            await update.message.reply_text(extra, parse_mode="HTML")
+    except Exception as exc:
+        logger.warning("Friend login or fetch failed: %s", exc)
+        await msg.edit_text(
+            f"❌ <b>Could not fetch friend's timetable.</b>\n"
+            f"<i>{html_lib.escape(str(exc))}</i>\n\n"
+            "Please check the username and password and try again.",
+            parse_mode="HTML",
+        )
+
+
+async def friend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Lookup a classmate's timetable using ephemeral in-memory login."""
+    if not is_authorized(update):
+        await update.message.reply_text("⛔ You are not authorized to use this bot.")
+        return
+
+    context.user_data["friend_login"] = True
+    context.user_data["login_state"] = STATE_WAITING_USERNAME
+    await update.message.reply_text(
+        "👥 <b>Friend's Timetable (Step 1 of 2)</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "Please send your friend's ERP <b>username / Student ID</b>:\n\n"
+        "<i>(Their credentials will be used once in-memory and will never be saved to database)</i>\n"
+        "<i>Send /cancel to abort.</i>",
+        parse_mode="HTML",
+    )
+
+
 async def login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
         await update.message.reply_text("⛔ You are not authorized to use this bot.")
@@ -277,6 +340,7 @@ async def handle_login_message(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data.pop("login_state", None)
         context.user_data.pop("erp_username", None)
         context.user_data.pop("lms_username", None)
+        context.user_data.pop("friend_login", None)
         context.user_data.pop("outpass_flow", None)
         await update.message.reply_text("❌ Action cancelled.")
         return
@@ -290,6 +354,7 @@ async def handle_login_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if state == STATE_WAITING_PASSWORD:
         username = context.user_data.pop("erp_username", "")
+        is_friend = context.user_data.pop("friend_login", False)
         context.user_data.pop("login_state", None)
         password = text
 
@@ -303,7 +368,10 @@ async def handle_login_message(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_text("⚠️ Something went wrong. Start again.")
             return
 
-        await _run_login(update, username, password)
+        if is_friend:
+            await _run_friend_login(update, username, password)
+        else:
+            await _run_login(update, username, password)
         return
 
     # --- LMS Login Flow ---
@@ -399,11 +467,11 @@ async def _send_lms_pending_tasks(
     message_to_edit=None,
     force_refresh: bool = False,
 ) -> None:
-    """Fetch pending tasks from LMS and display the interactive card."""
+    """Fetch pending tasks from LMS and display the interactive card (with multi-part chunking if tasks exceed limit)."""
     try:
         tasks = await LMSService.fetch_all_pending_tasks(user_id, force_refresh=force_refresh)
         _, student_name = await LMSService.get_authenticated_client(user_id)
-        formatted_text = LMSService.format_tasks_telegram_message(tasks, student_name=student_name)
+        messages = LMSService.get_tasks_telegram_messages(tasks, student_name=student_name)
 
         keyboard = InlineKeyboardMarkup([
             [
@@ -424,25 +492,39 @@ async def _send_lms_pending_tasks(
             state.get("reminded_6h", []),
         )
 
+        first_text = messages[0] if messages else "<b>All Caught Up</b>"
+
         if message_to_edit:
             await message_to_edit.edit_text(
-                formatted_text,
+                first_text,
                 parse_mode="HTML",
                 reply_markup=keyboard,
                 disable_web_page_preview=True,
             )
         else:
             await update.effective_message.reply_text(
-                formatted_text,
+                first_text,
                 parse_mode="HTML",
                 reply_markup=keyboard,
                 disable_web_page_preview=True,
             )
+
+        # Dispatch any subsequent overflow chunks to prevent 4096 character errors
+        for extra_text in messages[1:]:
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=extra_text,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+            except Exception as send_err:
+                logger.warning("Could not send extra task chunk: %s", send_err)
     except Exception as exc:
         logger.exception("Error fetching pending tasks for user %s: %s", user_id, exc)
         err_msg = (
             "⚠️ <b>Could not fetch LMS tasks.</b>\n"
-            f"<i>{str(exc)}</i>\n\n"
+            f"<i>{html_lib.escape(str(exc))}</i>\n\n"
             "If your LMS password changed, please run /lms_login to reconnect."
         )
         if message_to_edit:
@@ -588,41 +670,21 @@ async def check_lms_deadlines_and_new_tasks(context: ContextTypes.DEFAULT_TYPE) 
     logger.info("Running periodic LMS deadline & new task scan for %d users...", len(user_ids))
 
     for uid in user_ids:
-        try:
-            tasks = await LMSService.fetch_all_pending_tasks(uid)
-            state = storage.get_lms_task_state(uid)
-            seen_ids = set(state.get("seen_task_ids", []))
-            reminded_48h = set(state.get("reminded_48h", []))
-            reminded_6h = set(state.get("reminded_6h", []))
+        user_lock = await workload_manager.user_locks.get_lock(uid)
+        async with user_lock:
+            try:
+                tasks = await LMSService.fetch_all_pending_tasks(uid)
+                state = storage.get_lms_task_state(uid)
+                seen_ids = set(state.get("seen_task_ids", []))
+                reminded_48h = set(state.get("reminded_48h", []))
+                reminded_6h = set(state.get("reminded_6h", []))
 
-            is_first_sync = len(seen_ids) == 0
+                is_first_sync = len(seen_ids) == 0
 
-            # 1. Detect New Tasks
-            for task in tasks:
-                if not is_first_sync and task.id not in seen_ids and task.seconds_remaining > 0:
-                    alert_text = LMSService.format_new_task_alert(task)
-                    btn_kb = InlineKeyboardMarkup([[InlineKeyboardButton("Open LMS Submission", url=task.url)]]) if task.url else None
-                    try:
-                        await context.bot.send_message(
-                            chat_id=uid,
-                            text=alert_text,
-                            parse_mode="HTML",
-                            reply_markup=btn_kb,
-                            disable_web_page_preview=True,
-                        )
-                        logger.info("Sent new LMS task alert (%s) to user %s", task.id, uid)
-                        await asyncio.sleep(1.5)
-                    except Exception as exc:
-                        logger.warning("Could not send new task alert to user %s: %s", uid, exc)
-
-                seen_ids.add(task.id)
-
-            # 2. Check 2-Day (48h) Deadlines
-            for task in tasks:
-                rem_secs = task.seconds_remaining
-                if 6 * 3600 < rem_secs <= 48 * 3600:
-                    if task.id not in reminded_48h:
-                        alert_text = LMSService.format_2day_reminder_alert(task)
+                # 1. Detect New Tasks
+                for task in tasks:
+                    if not is_first_sync and task.id not in seen_ids and task.seconds_remaining > 0:
+                        alert_text = LMSService.format_new_task_alert(task)
                         btn_kb = InlineKeyboardMarkup([[InlineKeyboardButton("Open LMS Submission", url=task.url)]]) if task.url else None
                         try:
                             await context.bot.send_message(
@@ -632,43 +694,65 @@ async def check_lms_deadlines_and_new_tasks(context: ContextTypes.DEFAULT_TYPE) 
                                 reply_markup=btn_kb,
                                 disable_web_page_preview=True,
                             )
-                            reminded_48h.add(task.id)
-                            logger.info("Sent 2-day reminder for task %s to user %s", task.id, uid)
+                            logger.info("Sent new LMS task alert (%s) to user %s", task.id, uid)
                             await asyncio.sleep(1.5)
                         except Exception as exc:
-                            logger.warning("Could not send 2-day reminder to user %s: %s", uid, exc)
+                            logger.warning("Could not send new task alert to user %s: %s", uid, exc)
 
-            # 3. Check Urgent (<6h) Deadlines
-            for task in tasks:
-                rem_secs = task.seconds_remaining
-                if 0 < rem_secs <= 6 * 3600:
-                    if task.id not in reminded_6h:
-                        alert_text = LMSService.format_urgent_reminder_alert(task)
-                        btn_kb = InlineKeyboardMarkup([[InlineKeyboardButton("Submit on LMS Now", url=task.url)]]) if task.url else None
-                        try:
-                            await context.bot.send_message(
-                                chat_id=uid,
-                                text=alert_text,
-                                parse_mode="HTML",
-                                reply_markup=btn_kb,
-                                disable_web_page_preview=True,
-                            )
-                            reminded_6h.add(task.id)
-                            logger.info("Sent urgent reminder for task %s to user %s", task.id, uid)
-                            await asyncio.sleep(1.5)
-                        except Exception as exc:
-                            logger.warning("Could not send urgent alert to user %s: %s", uid, exc)
+                    seen_ids.add(task.id)
 
-            # Save state
-            storage.update_lms_task_state(
-                uid,
-                list(seen_ids),
-                list(reminded_48h),
-                list(reminded_6h),
-            )
+                # 2. Check 2-Day (48h) Deadlines
+                for task in tasks:
+                    rem_secs = task.seconds_remaining
+                    if 6 * 3600 < rem_secs <= 48 * 3600:
+                        if task.id not in reminded_48h:
+                            alert_text = LMSService.format_2day_reminder_alert(task)
+                            btn_kb = InlineKeyboardMarkup([[InlineKeyboardButton("Open LMS Submission", url=task.url)]]) if task.url else None
+                            try:
+                                await context.bot.send_message(
+                                    chat_id=uid,
+                                    text=alert_text,
+                                    parse_mode="HTML",
+                                    reply_markup=btn_kb,
+                                    disable_web_page_preview=True,
+                                )
+                                reminded_48h.add(task.id)
+                                logger.info("Sent 2-day reminder for task %s to user %s", task.id, uid)
+                                await asyncio.sleep(1.5)
+                            except Exception as exc:
+                                logger.warning("Could not send 2-day reminder to user %s: %s", uid, exc)
 
-        except Exception as exc:
-            logger.error("Error during LMS scan for user %s: %s", uid, exc)
+                # 3. Check Urgent (<6h) Deadlines
+                for task in tasks:
+                    rem_secs = task.seconds_remaining
+                    if 0 < rem_secs <= 6 * 3600:
+                        if task.id not in reminded_6h:
+                            alert_text = LMSService.format_urgent_reminder_alert(task)
+                            btn_kb = InlineKeyboardMarkup([[InlineKeyboardButton("Submit on LMS Now", url=task.url)]]) if task.url else None
+                            try:
+                                await context.bot.send_message(
+                                    chat_id=uid,
+                                    text=alert_text,
+                                    parse_mode="HTML",
+                                    reply_markup=btn_kb,
+                                    disable_web_page_preview=True,
+                                )
+                                reminded_6h.add(task.id)
+                                logger.info("Sent urgent reminder for task %s to user %s", task.id, uid)
+                                await asyncio.sleep(1.5)
+                            except Exception as exc:
+                                logger.warning("Could not send urgent alert to user %s: %s", uid, exc)
+
+                # Save state
+                storage.update_lms_task_state(
+                    uid,
+                    list(seen_ids),
+                    list(reminded_48h),
+                    list(reminded_6h),
+                )
+
+            except Exception as exc:
+                logger.error("Error during LMS scan for user %s: %s", uid, exc)
 
         await asyncio.sleep(2.0)
 
@@ -870,6 +954,11 @@ async def _prefetch_user_job(uid: int, saved_creds: dict, metric=None) -> Option
 
 async def _prefetch_morning_timetables(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Bounded concurrent morning prefetch (starts at 06:30 IST): pre-authenticates and caches timetables in MongoDB."""
+    today_name = _today_day_name()
+    if today_name == "Sun":
+        logger.info("Morning prefetch skipped: today is Sunday.")
+        return
+
     morning_uids = storage.get_all_morning_users()
     if not morning_uids:
         return
@@ -910,12 +999,16 @@ async def _send_morning_timetable(context: ContextTypes.DEFAULT_TYPE) -> None:
       Tier 3: ERP Fallback (live fetch if prefetch expired)
     Dispatches via TelegramOutbox (rate-limited, honors 429).
     """
+    today_name = _today_day_name()
+    if today_name == "Sun":
+        logger.info("Morning timetable delivery skipped: today is Sunday.")
+        return
+
     morning_uids = storage.get_all_morning_users()
     if not morning_uids:
         logger.info("Morning timetable skipped: no users with morning alerts enabled.")
         return
 
-    today_name = _today_day_name()
     for chat_id in morning_uids:
         # Tier 1: In-memory RAM cache
         html = _morning_cache.get(chat_id)
@@ -941,13 +1034,15 @@ async def _send_morning_timetable(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         if html:
             try:
-                message = format_timetable_for_telegram(html, day=today_name)
-                await workload_manager.outbox.send_message(
-                    chat_id=chat_id,
-                    text=f"🌅 <b>Good morning! Here is today's schedule ({today_name}):</b>\n\n{message}",
-                    parse_mode="HTML",
-                )
-                logger.info("Dispatched morning timetable to outbox for chat_id=%s", chat_id)
+                messages = get_timetable_messages(html, day_filter=today_name)
+                for idx, chunk in enumerate(messages):
+                    header = f"🌅 <b>Good morning! Here is today's schedule ({today_name}):</b>\n\n" if idx == 0 else f"🌅 <b>Schedule ({today_name}) - Part {idx + 1}:</b>\n\n"
+                    await workload_manager.outbox.send_message(
+                        chat_id=chat_id,
+                        text=f"{header}{chunk}",
+                        parse_mode="HTML",
+                    )
+                logger.info("Dispatched morning timetable to outbox for chat_id=%s (%d parts)", chat_id, len(messages))
             except Exception as e:
                 logger.exception("Error formatting morning timetable for chat_id=%s: %s", chat_id, e)
         else:
@@ -1282,6 +1377,7 @@ def main() -> None:
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("login", login))
+    application.add_handler(CommandHandler("friend", friend))
     application.add_handler(CommandHandler("timetable", timetable))
     application.add_handler(CommandHandler("week", week))
     application.add_handler(CommandHandler("submissions", submissions))
@@ -1306,9 +1402,10 @@ def main() -> None:
     # Schedule the periodic LMS deadline & new task alert job.
     _schedule_lms_alerts_job(application)
 
-    # Schedule memory cleanup for rate limiter inactive users every 5 minutes.
+    # Schedule memory cleanup for rate limiter inactive users and idle locks every 5 minutes.
     async def _cleanup_rate_limiter_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         security.rate_limiter.cleanup_inactive_users()
+        await workload_manager.user_locks.cleanup_idle_locks()
 
     if application.job_queue:
         application.job_queue.run_repeating(

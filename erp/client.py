@@ -154,30 +154,70 @@ async def _follow_redirects(
 
 
 _user_clients: dict[int, httpx.AsyncClient] = {}
+_user_clients_last_used: dict[int, float] = {}
+_MAX_CONCURRENT_CLIENTS = 60
+_CLIENT_IDLE_TIMEOUT = 900.0  # 15 minutes
+
+
+def _prune_stale_clients(force_count: Optional[int] = None) -> None:
+    """Close and evict idle AsyncClients to prevent OS socket and file descriptor leaks."""
+    now = time.time()
+    stale_uids = []
+
+    for uid, last_time in list(_user_clients_last_used.items()):
+        if now - last_time > _CLIENT_IDLE_TIMEOUT:
+            stale_uids.append(uid)
+
+    # If still above capacity, evict least recently used
+    if force_count or (len(_user_clients) - len(stale_uids) > _MAX_CONCURRENT_CLIENTS):
+        needed = force_count or (len(_user_clients) - len(stale_uids) - _MAX_CONCURRENT_CLIENTS + 10)
+        sorted_by_lru = sorted(
+            [u for u in _user_clients_last_used if u not in stale_uids],
+            key=lambda u: _user_clients_last_used[u],
+        )
+        stale_uids.extend(sorted_by_lru[:needed])
+
+    for uid in stale_uids:
+        client = _user_clients.pop(uid, None)
+        _user_clients_last_used.pop(uid, None)
+        if client and not client.is_closed:
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(client.aclose())
+            except RuntimeError:
+                pass
 
 
 def get_erp_client_for_user(user_id: Optional[int] = None, timeout: float = 35.0) -> httpx.AsyncClient:
     """
     Return a dedicated AsyncClient with Keep-Alive connection pooling for this specific user.
-    Maintains persistent connections to newerp.kluniversity.in for ultra-fast live fetching,
+    Maintains persistent connections to newerp.kluniversity.in for fast live fetching,
     while guaranteeing 100% cookie and session isolation between different users.
+    Includes automated LRU and idle eviction to prevent socket exhaustion.
     """
+    import os
+    verify_ssl = os.getenv("ERP_VERIFY_SSL", "false").lower() in ("true", "1", "yes")
+
     if user_id is not None:
         uid = int(user_id)
+        _prune_stale_clients()
+
         client = _user_clients.get(uid)
         if client is None or client.is_closed:
             client = httpx.AsyncClient(
-                verify=True,
+                verify=verify_ssl,
                 timeout=timeout,
-                limits=httpx.Limits(max_keepalive_connections=5, max_connections=10, keepalive_expiry=90.0),
+                limits=httpx.Limits(max_keepalive_connections=5, max_connections=10, keepalive_expiry=60.0),
                 http2=False,
                 follow_redirects=False,
             )
             _user_clients[uid] = client
+
+        _user_clients_last_used[uid] = time.time()
         return client
 
     return httpx.AsyncClient(
-        verify=True,
+        verify=verify_ssl,
         timeout=timeout,
         http2=False,
         follow_redirects=False,
@@ -187,6 +227,7 @@ def get_erp_client_for_user(user_id: Optional[int] = None, timeout: float = 35.0
 def reset_user_client(user_id: int) -> None:
     """Close and remove the dedicated AsyncClient for a user (called on logout or fresh login)."""
     uid = int(user_id)
+    _user_clients_last_used.pop(uid, None)
     client = _user_clients.pop(uid, None)
     if client and not client.is_closed:
         try:
