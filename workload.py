@@ -445,10 +445,19 @@ class WorkloadManager:
                     try:
                         import inspect
                         sig = inspect.signature(job.handler)
+                        call_kwargs = dict(job.kwargs)
                         if "metric" in sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
-                            res = await job.handler(*job.args, metric=m, **job.kwargs)
-                        else:
-                            res = await job.handler(*job.args, **job.kwargs)
+                            call_kwargs["metric"] = m
+                        if "user_id" in sig.parameters:
+                            param_names = list(sig.parameters.keys())
+                            user_id_idx = param_names.index("user_id")
+                            if user_id_idx >= len(job.args):
+                                if "user_id" not in call_kwargs or call_kwargs["user_id"] is None:
+                                    call_kwargs["user_id"] = user_id
+                        elif "user_id" in call_kwargs and not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+                            call_kwargs.pop("user_id", None)
+
+                        res = await job.handler(*job.args, **call_kwargs)
                         m.success = True
                         if job.future and not job.future.done():
                             job.future.set_result(res)
@@ -474,24 +483,62 @@ class WorkloadManager:
     async def submit_job(
         self,
         queue: asyncio.Queue,
-        user_id: int,
-        operation: str,
-        queue_name: str,
-        handler: Callable[..., Coroutine[Any, Any, Any]],
         *args,
         **kwargs,
     ) -> Any:
-        """Submit a job to a specific queue and await its result asynchronously."""
+        """
+        Submit a job to a specific queue and await its result asynchronously.
+        Supports both positional and keyword invocations without argument conflicts:
+            submit_job(queue, user_id, operation, queue_name, handler, *args, **kwargs)
+            submit_job(queue, user_id=..., operation=..., queue_name=..., handler=..., **kwargs)
+        """
+        arg_list = list(args)
+
+        # 1. user_id
+        if arg_list:
+            user_id = arg_list.pop(0)
+        elif "user_id" in kwargs:
+            user_id = kwargs.pop("user_id")
+        else:
+            raise TypeError("submit_job() missing required argument: 'user_id'")
+
+        # 2. operation
+        if arg_list:
+            operation = arg_list.pop(0)
+        elif "operation" in kwargs:
+            operation = kwargs.pop("operation")
+        else:
+            operation = "unknown"
+
+        # 3. queue_name
+        if arg_list:
+            queue_name = arg_list.pop(0)
+        elif "queue_name" in kwargs:
+            queue_name = kwargs.pop("queue_name")
+        else:
+            queue_name = "general"
+
+        # 4. handler
+        if arg_list:
+            handler = arg_list.pop(0)
+        elif "handler" in kwargs:
+            handler = kwargs.pop("handler")
+        else:
+            raise TypeError("submit_job() missing required argument: 'handler'")
+
+        handler_args = tuple(arg_list)
+        handler_kwargs = kwargs
+
         loop = asyncio.get_running_loop()
         fut = loop.create_future()
-        job_id = self._next_job_id(operation)
+        job_id = self._next_job_id(str(operation))
         now_perf = time.perf_counter()
 
         metrics = JobMetrics(
             job_id=job_id,
             user_id=int(user_id),
-            operation=operation,
-            queue_name=queue_name,
+            operation=str(operation),
+            queue_name=str(queue_name),
             created_at=time.time(),
             enqueued_at=now_perf,
         )
@@ -499,8 +546,8 @@ class WorkloadManager:
         job = Job(
             metrics=metrics,
             handler=handler,
-            args=args,
-            kwargs=kwargs,
+            args=handler_args,
+            kwargs=handler_kwargs,
             future=fut,
         )
 
