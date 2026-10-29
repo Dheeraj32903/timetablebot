@@ -42,6 +42,13 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({ data, loading, onN
     getNotificationPermission()
   );
 
+  // Sync state when data loads or updates
+  useEffect(() => {
+    if (data?.user?.morning_alerts_enabled !== undefined) {
+      setMorningEnabled(data.user.morning_alerts_enabled);
+    }
+  }, [data?.user?.morning_alerts_enabled]);
+
   // Monitor network connectivity changes
   useEffect(() => {
     const handleOnline = () => {
@@ -68,16 +75,21 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({ data, loading, onN
   }, [data, isOnline]);
 
   const handleToggleMorning = async () => {
+    if (toggling) return;
+    const nextVal = !morningEnabled;
+    setMorningEnabled(nextVal); // Optimistic UI toggle
     setToggling(true);
     try {
-      const nextVal = !morningEnabled;
       const res = await toggleMorningAlerts(nextVal);
       setMorningEnabled(res);
       if (window.Telegram?.WebApp?.HapticFeedback) {
         window.Telegram.WebApp.HapticFeedback.impactOccurred('medium');
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error('Failed to toggle morning alert:', err);
+      setMorningEnabled(!nextVal); // Rollback on failure
+      const errorMsg = err?.response?.data?.detail || err?.message || 'Failed to update setting';
+      alert(`Could not toggle morning alert: ${errorMsg}`);
     } finally {
       setToggling(false);
     }

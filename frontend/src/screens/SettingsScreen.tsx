@@ -22,19 +22,32 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({ user, onUserUpda
   const [morningAlerts, setMorningAlerts] = useState<boolean>(user?.morning_alerts_enabled ?? false);
   const [toggling, setToggling] = useState<boolean>(false);
 
+  // Sync state whenever user profile updates
+  useEffect(() => {
+    if (user?.morning_alerts_enabled !== undefined) {
+      setMorningAlerts(user.morning_alerts_enabled);
+    }
+  }, [user?.morning_alerts_enabled]);
+
   const handleToggleMorning = async () => {
-    if (!user) return;
+    if (toggling) return;
+    const nextVal = !morningAlerts;
+    setMorningAlerts(nextVal); // Optimistic UI toggle
     setToggling(true);
     try {
-      const nextVal = !morningAlerts;
       const res = await toggleMorningAlerts(nextVal);
       setMorningAlerts(res);
-      onUserUpdate({ ...user, morning_alerts_enabled: res });
+      if (user) {
+        onUserUpdate({ ...user, morning_alerts_enabled: res });
+      }
       if (window.Telegram?.WebApp?.HapticFeedback) {
         window.Telegram.WebApp.HapticFeedback.impactOccurred('medium');
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error('Failed to toggle morning alerts:', err);
+      setMorningAlerts(!nextVal); // Rollback on failure
+      const errorMsg = err?.response?.data?.detail || err?.message || 'Failed to update setting';
+      alert(`Could not toggle morning alert: ${errorMsg}`);
     } finally {
       setToggling(false);
     }

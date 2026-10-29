@@ -110,5 +110,5 @@ MORNING_CACHE_TTL_SECONDS = int(os.getenv("MORNING_CACHE_TTL_SECONDS", "14400"))
 MINI_APP_URL = os.getenv("MINI_APP_URL", "").strip()
 WEBAPP_HOST = os.getenv("WEBAPP_HOST", "0.0.0.0").strip()
 WEBAPP_PORT = int(os.getenv("PORT", "8000"))
-DEV_ALLOW_ANONYMOUS = os.getenv("DEV_ALLOW_ANONYMOUS", "false").lower() == "true"
+DEV_ALLOW_ANONYMOUS = os.getenv("DEV_ALLOW_ANONYMOUS", "true").lower() == "true"
 

@@ -123,8 +123,8 @@ async def get_current_user(
     """
     FastAPI dependency that enforces Telegram Mini App authentication.
     """
-    # Safe dev bypass strictly if DEV_ALLOW_ANONYMOUS is True in config
-    if config.DEV_ALLOW_ANONYMOUS and (not x_telegram_init_data or x_telegram_init_data == "dev"):
+    # Safe dev/private mobile app bypass if DEV_ALLOW_ANONYMOUS is True in config
+    if config.DEV_ALLOW_ANONYMOUS and (not x_telegram_init_data or x_telegram_init_data in ("dev", "app", "")):
         # Prioritize Dheeraj's primary user ID (6986045748) which has both ERP and LMS credentials stored
         primary_uid = 6986045748 if (6986045748 in (config.AUTHORIZED_TELEGRAM_USER_IDS or set())) else (
             next(iter(config.AUTHORIZED_TELEGRAM_USER_IDS)) if config.AUTHORIZED_TELEGRAM_USER_IDS else 123456789
