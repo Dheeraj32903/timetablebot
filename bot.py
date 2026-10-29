@@ -2,6 +2,7 @@ import asyncio
 import html as html_lib
 import logging
 import random
+import re
 import time
 from datetime import datetime, time as dt_time
 
@@ -15,6 +16,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Update,
+    WebAppInfo,
 )
 from telegram.constants import ChatMemberStatus
 from telegram.ext import (
@@ -119,50 +121,49 @@ BOT_COMMANDS = [
 WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 
 
-def get_timetable_keyboard(current_day: str) -> InlineKeyboardMarkup:
-    """Generate dynamic day pagination inline keyboard."""
-    norm_day = _normalize_day_name(current_day)
-    try:
-        curr_idx = WEEKDAYS.index(norm_day)
-    except ValueError:
-        curr_idx = 0
-    prev_day = WEEKDAYS[(curr_idx - 1) % len(WEEKDAYS)]
-    next_day = WEEKDAYS[(curr_idx + 1) % len(WEEKDAYS)]
-
-    row1 = [
-        InlineKeyboardButton(f"◀️ {prev_day}", callback_data=f"tt:day:{prev_day}"),
-        InlineKeyboardButton(f"• {norm_day} •", callback_data=f"tt:refresh:{norm_day}"),
-        InlineKeyboardButton(f"{next_day} ▶️", callback_data=f"tt:day:{next_day}"),
-    ]
-    row2 = [
-        InlineKeyboardButton("📅 Today", callback_data=f"tt:day:{_today_day_name()}"),
-        InlineKeyboardButton("🗓️ Full Week", callback_data="tt:week"),
-        InlineKeyboardButton("🔄 Refresh", callback_data=f"tt:refresh:{norm_day}"),
-    ]
-    row3 = [
-        InlineKeyboardButton("🏠 Main Dashboard", callback_data="menu:open"),
-    ]
-    return InlineKeyboardMarkup([row1, row2, row3])
+def get_timetable_keyboard(current_day: str) -> Optional[InlineKeyboardMarkup]:
+    """Return None to keep timetable responses clean without inline buttons."""
+    return None
 
 
-def _build_dashboard_payload(user_id: int, first_name: str = "Student") -> Tuple[str, InlineKeyboardMarkup]:
-    """Generate an interactive, stateful student hub dashboard."""
+def _clean_display_name(raw_name: str) -> str:
+    """Format Telegram first_name cleanly, stripping leading student ID or symbols."""
+    if not raw_name:
+        return "Student"
+    cleaned = re.sub(r"^\d+[\s_\-]+", "", raw_name.strip())
+    cleaned = cleaned.strip(" _-")
+    return cleaned or raw_name.strip()
+
+
+def _build_dashboard_payload(user_id: int, first_name: str = "Student") -> Tuple[str, Optional[InlineKeyboardMarkup]]:
+    """Generate a clean, simple student hub dashboard card without inline buttons."""
     saved_erp = credentials.load_user_credentials(user_id)
     saved_lms = credentials.load_user_lms_credentials(user_id)
     erp_session = load_session(user_id=user_id)
     morning_on = storage.is_user_morning_enabled(user_id)
 
+    clean_name = _clean_display_name(first_name)
+    name_escaped = html_lib.escape(clean_name or "Student")
+
+    student_id = (saved_erp or {}).get("username") or (saved_lms or {}).get("username") or ""
+    if not student_id and first_name:
+        m = re.search(r"^\d+", first_name.strip())
+        if m:
+            student_id = m.group(0)
+
+    id_line = f"<b>Student ID:</b> <code>{html_lib.escape(student_id)}</code>\n" if student_id else ""
+
     # ERP status badge
     if saved_erp and erp_session and erp_session.get("cookies"):
-        erp_badge = f"🟢 <b>Active</b> (<code>{html_lib.escape(saved_erp.get('username', ''))}</code>)"
+        erp_badge = "🟢 <b>Active</b>"
     elif saved_erp:
-        erp_badge = f"🟡 <b>Stored</b> (<code>{html_lib.escape(saved_erp.get('username', ''))}</code>)"
+        erp_badge = "🟡 <b>Stored</b>"
     else:
         erp_badge = "🔴 <b>Not Connected</b> (/login)"
 
     # LMS status badge
     if saved_lms:
-        lms_badge = f"🟢 <b>Connected</b> (<code>{html_lib.escape(saved_lms.get('username', ''))}</code>)"
+        lms_badge = "🟢 <b>Connected</b>"
     else:
         lms_badge = "⚪ <b>Not Connected</b> (/lms_login)"
 
@@ -172,38 +173,17 @@ def _build_dashboard_payload(user_id: int, first_name: str = "Student") -> Tuple
     else:
         morning_badge = "🔕 <b>Disabled</b>"
 
-    name_escaped = html_lib.escape(first_name or "Student")
     text = (
-        f"🎓 <b>Welcome, {name_escaped}!</b>\n"
-        f"<i>KL University Smart Academic Hub</i>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🏫 <b>ERP Schedule:</b> {erp_badge}\n"
-        f"📚 <b>Moodle LMS:</b> {lms_badge}\n"
-        f"⏰ <b>Morning Dispatch:</b> {morning_badge}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"👇 <b>Quick Actions:</b>"
+        f"<b>Welcome, {name_escaped}</b>\n"
+        f"<i>KL University Student Hub</i>\n\n"
+        f"{id_line}"
+        f"• <b>ERP Schedule:</b> {erp_badge}\n"
+        f"• <b>Moodle LMS:</b> {lms_badge}\n"
+        f"• <b>Morning Dispatch:</b> {morning_badge}\n\n"
+        f"<i>Use the <b>Menu</b> button below to access all commands and services.</i>"
     )
 
-    buttons = [
-        [
-            InlineKeyboardButton("📅 Today's Classes", callback_data=f"menu:timetable:{_today_day_name()}"),
-            InlineKeyboardButton("🗓️ Weekly Timetable", callback_data="menu:week"),
-        ],
-        [
-            InlineKeyboardButton("📋 LMS Submissions", callback_data="menu:submissions"),
-            InlineKeyboardButton("🏠 Hostel Outpass", callback_data="menu:outpass"),
-        ],
-        [
-            InlineKeyboardButton("👥 Friend Schedule", callback_data="menu:friend"),
-            InlineKeyboardButton("🔔 Toggle Morning Alert", callback_data="menu:morning_toggle"),
-        ],
-        [
-            InlineKeyboardButton("📊 Account & Status", callback_data="menu:status"),
-            InlineKeyboardButton("❓ Help & Commands", callback_data="menu:help"),
-        ]
-    ]
-
-    return text, InlineKeyboardMarkup(buttons)
+    return text, None
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -572,13 +552,6 @@ async def _send_lms_pending_tasks(
         _, student_name = await LMSService.get_authenticated_client(user_id)
         messages = LMSService.get_tasks_telegram_messages(tasks, student_name=student_name)
 
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("🔄 Refresh Tasks", callback_data="lms:refresh"),
-                InlineKeyboardButton("🚪 Disconnect LMS", callback_data="lms:logout"),
-            ]
-        ])
-
         # Track seen tasks to prevent duplicate alerts
         state = storage.get_lms_task_state(user_id)
         current_seen = set(state.get("seen_task_ids", []))
@@ -597,14 +570,14 @@ async def _send_lms_pending_tasks(
             await message_to_edit.edit_text(
                 first_text,
                 parse_mode="HTML",
-                reply_markup=keyboard,
+                reply_markup=None,
                 disable_web_page_preview=True,
             )
         else:
             await update.effective_message.reply_text(
                 first_text,
                 parse_mode="HTML",
-                reply_markup=keyboard,
+                reply_markup=None,
                 disable_web_page_preview=True,
             )
 
@@ -784,13 +757,12 @@ async def check_lms_deadlines_and_new_tasks(context: ContextTypes.DEFAULT_TYPE) 
                 for task in tasks:
                     if not is_first_sync and task.id not in seen_ids and task.seconds_remaining > 0:
                         alert_text = LMSService.format_new_task_alert(task)
-                        btn_kb = InlineKeyboardMarkup([[InlineKeyboardButton("Open LMS Submission", url=task.url)]]) if task.url else None
                         try:
                             await context.bot.send_message(
                                 chat_id=uid,
                                 text=alert_text,
                                 parse_mode="HTML",
-                                reply_markup=btn_kb,
+                                reply_markup=None,
                                 disable_web_page_preview=True,
                             )
                             logger.info("Sent new LMS task alert (%s) to user %s", task.id, uid)
@@ -806,13 +778,12 @@ async def check_lms_deadlines_and_new_tasks(context: ContextTypes.DEFAULT_TYPE) 
                     if 6 * 3600 < rem_secs <= 48 * 3600:
                         if task.id not in reminded_48h:
                             alert_text = LMSService.format_2day_reminder_alert(task)
-                            btn_kb = InlineKeyboardMarkup([[InlineKeyboardButton("Open LMS Submission", url=task.url)]]) if task.url else None
                             try:
                                 await context.bot.send_message(
                                     chat_id=uid,
                                     text=alert_text,
                                     parse_mode="HTML",
-                                    reply_markup=btn_kb,
+                                    reply_markup=None,
                                     disable_web_page_preview=True,
                                 )
                                 reminded_48h.add(task.id)
@@ -827,13 +798,12 @@ async def check_lms_deadlines_and_new_tasks(context: ContextTypes.DEFAULT_TYPE) 
                     if 0 < rem_secs <= 6 * 3600:
                         if task.id not in reminded_6h:
                             alert_text = LMSService.format_urgent_reminder_alert(task)
-                            btn_kb = InlineKeyboardMarkup([[InlineKeyboardButton("Submit on LMS Now", url=task.url)]]) if task.url else None
                             try:
                                 await context.bot.send_message(
                                     chat_id=uid,
                                     text=alert_text,
                                     parse_mode="HTML",
-                                    reply_markup=btn_kb,
+                                    reply_markup=None,
                                     disable_web_page_preview=True,
                                 )
                                 reminded_6h.add(task.id)
@@ -983,19 +953,10 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await status_msg.edit_text("⚠️ <i>Could not extract timetable. Please check in ERP.</i>", parse_mode="HTML")
             return
 
-        week_kb = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(f"📅 View Today ({_today_day_name()})", callback_data=f"tt:day:{_today_day_name()}"),
-                InlineKeyboardButton("🔄 Refresh Week", callback_data="tt:week"),
-            ],
-            [
-                InlineKeyboardButton("🏠 Main Dashboard", callback_data="menu:open"),
-            ]
-        ])
         await status_msg.edit_text(
             messages[0],
             parse_mode="HTML",
-            reply_markup=week_kb,
+            reply_markup=None,
         )
         for extra_msg in messages[1:]:
             await update.message.reply_text(extra_msg, parse_mode="HTML")
@@ -1276,7 +1237,7 @@ async def morning(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
-def _build_status_payload(user_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+def _build_status_payload(user_id: int) -> Tuple[str, Optional[InlineKeyboardMarkup]]:
     """Generate a rich, interactive account and integration status dashboard."""
     saved_erp = credentials.load_user_credentials(user_id)
     saved_lms = credentials.load_user_lms_credentials(user_id)
@@ -1297,10 +1258,8 @@ def _build_status_payload(user_id: int) -> Tuple[str, InlineKeyboardMarkup]:
 
     if morning_on:
         morning_status_line = f"🔔 <b>Enabled</b> (Daily {config.MORNING_TIMETABLE_HOUR:02d}:{config.MORNING_TIMETABLE_MINUTE:02d} IST)"
-        morning_btn = InlineKeyboardButton("🔕 Disable Morning Alert", callback_data="status:toggle_morning")
     else:
         morning_status_line = "🔕 <b>Disabled</b>"
-        morning_btn = InlineKeyboardButton("🔔 Enable Morning Alert", callback_data="status:toggle_morning")
 
     text = (
         "📊 <b>Account & Integration Status</b>\n"
@@ -1313,32 +1272,7 @@ def _build_status_payload(user_id: int) -> Tuple[str, InlineKeyboardMarkup]:
         "━━━━━━━━━━━━━━━━━━━━━━"
     )
 
-    buttons = [
-        [
-            InlineKeyboardButton("🔄 Refresh Status", callback_data="status:refresh"),
-            morning_btn,
-        ],
-    ]
-
-    action_row = []
-    if not saved_erp:
-        action_row.append(InlineKeyboardButton("🔑 Connect ERP", callback_data="status:login"))
-    else:
-        action_row.append(InlineKeyboardButton("🚪 Log Out ERP", callback_data="status:logout_erp"))
-
-    if not saved_lms:
-        action_row.append(InlineKeyboardButton("📚 Connect LMS", callback_data="status:lms_login"))
-    else:
-        action_row.append(InlineKeyboardButton("🚪 Disconnect LMS", callback_data="status:logout_lms"))
-
-    if action_row:
-        buttons.append(action_row)
-
-    buttons.append([
-        InlineKeyboardButton("🏠 Main Dashboard", callback_data="menu:open"),
-    ])
-
-    return text, InlineKeyboardMarkup(buttons)
+    return text, None
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1408,16 +1342,7 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             context.user_data["last_timetable_html"] = html
             context.user_data["last_timetable_time"] = time.time()
             messages = get_timetable_messages(html)
-            week_kb = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(f"📅 View Today ({_today_day_name()})", callback_data=f"tt:day:{_today_day_name()}"),
-                    InlineKeyboardButton("🔄 Refresh Week", callback_data="tt:week"),
-                ],
-                [
-                    InlineKeyboardButton("🏠 Main Dashboard", callback_data="menu:open"),
-                ]
-            ])
-            await query.edit_message_text(messages[0] if messages else "⚠️ <i>Empty schedule</i>", parse_mode="HTML", reply_markup=week_kb)
+            await query.edit_message_text(messages[0] if messages else "⚠️ <i>Empty schedule</i>", parse_mode="HTML", reply_markup=None)
             for extra in messages[1:]:
                 await context.bot.send_message(chat_id=uid, text=extra, parse_mode="HTML")
         except Exception as exc:
@@ -1427,15 +1352,11 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if data == "menu:submissions":
         saved_lms = credentials.load_user_lms_credentials(uid)
         if not saved_lms:
-            connect_kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔗 Connect LMS Account", callback_data="status:lms_login")],
-                [InlineKeyboardButton("🏠 Main Dashboard", callback_data="menu:open")],
-            ])
             await query.edit_message_text(
                 "<b>LMS Not Connected</b>\n\n"
-                "Please connect your KL Moodle LMS account first to view your pending submissions and deadlines.",
+                "Please connect your KL Moodle LMS account first using /lms_login to view your pending submissions and deadlines.",
                 parse_mode="HTML",
-                reply_markup=connect_kb,
+                reply_markup=None,
             )
             return
 
@@ -1450,11 +1371,7 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             "Apply for digital hostel gate outing passes with instant warden routing.\n\n"
             "Send /outpass in chat to start the step-by-step application, or check your past requests."
         )
-        back_kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Apply via /outpass", callback_data="menu:open")],
-            [InlineKeyboardButton("🏠 Main Dashboard", callback_data="menu:open")],
-        ])
-        await query.edit_message_text(outpass_greeting, parse_mode="HTML", reply_markup=back_kb)
+        await query.edit_message_text(outpass_greeting, parse_mode="HTML", reply_markup=None)
         return
 
     if data == "menu:friend":
@@ -1512,8 +1429,7 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             "• <code>/logout</code> — Log out ERP and purge data\n"
             "━━━━━━━━━━━━━━━━━━━━━━"
         )
-        back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Back to Dashboard", callback_data="menu:open")]])
-        await query.edit_message_text(help_text, parse_mode="HTML", reply_markup=back_kb)
+        await query.edit_message_text(help_text, parse_mode="HTML", reply_markup=None)
         return
 
 
@@ -1598,17 +1514,8 @@ async def handle_timetable_callback(update: Update, context: ContextTypes.DEFAUL
                 return
 
         messages = get_timetable_messages(html)
-        week_kb = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(f"📅 View Today ({_today_day_name()})", callback_data=f"tt:day:{_today_day_name()}"),
-                InlineKeyboardButton("🔄 Refresh Week", callback_data="tt:week"),
-            ],
-            [
-                InlineKeyboardButton("🏠 Main Dashboard", callback_data="menu:open"),
-            ]
-        ])
         try:
-            await query.edit_message_text(messages[0], parse_mode="HTML", reply_markup=week_kb)
+            await query.edit_message_text(messages[0], parse_mode="HTML", reply_markup=None)
             for extra in messages[1:]:
                 await context.bot.send_message(chat_id=uid, text=extra, parse_mode="HTML")
         except Exception:
@@ -1764,42 +1671,31 @@ async def handle_user_status_change(update: Update, context: ContextTypes.DEFAUL
 
 
 async def _start_health_server(app: Application) -> None:
-    """Start a lightweight HTTP health responder if deployed on Render/Cloud (when PORT is set)."""
+    """Start the FastAPI WebApp & Health server on PORT for Render/Cloud deployment."""
     import os
-    port = os.getenv("PORT")
-    if not port:
-        return
+    port = os.getenv("PORT") or str(getattr(config, "WEBAPP_PORT", 8000))
     try:
         port_num = int(port)
+        host = getattr(config, "WEBAPP_HOST", "0.0.0.0")
 
-        async def handle_ping(reader, writer):
-            try:
-                # 3-second timeout prevents Slowloris socket exhaustion
-                await asyncio.wait_for(reader.read(1024), timeout=3.0)
-                response = (
-                    b"HTTP/1.1 200 OK\r\n"
-                    b"Content-Type: text/plain\r\n"
-                    b"Content-Length: 2\r\n"
-                    b"Connection: close\r\n"
-                    b"\r\n"
-                    b"OK"
-                )
-                writer.write(response)
-                await writer.drain()
-            except Exception:
-                pass
-            finally:
-                try:
-                    writer.close()
-                    await writer.wait_closed()
-                except Exception:
-                    pass
+        import uvicorn
+        from webapp.api import app as fastapi_app
 
-        server = await asyncio.start_server(handle_ping, "0.0.0.0", port_num)
-        app.bot_data["_health_server"] = server
-        logger.info("Health check server active on port %s for Render/Cloud deployment", port_num)
+        uvi_config = uvicorn.Config(
+            app=fastapi_app,
+            host=host,
+            port=port_num,
+            log_level="warning",
+            access_log=False,
+        )
+        server = uvicorn.Server(config=uvi_config)
+
+        task = asyncio.create_task(server.serve())
+        app.bot_data["_fastapi_server"] = server
+        app.bot_data["_fastapi_task"] = task
+        logger.info("FastAPI WebApp & Health server active on %s:%s for Render/Cloud deployment", host, port_num)
     except Exception as exc:
-        logger.warning("Could not start cloud health check server on port %s: %s", port, exc)
+        logger.warning("Could not start WebApp & Health server on port %s: %s", port, exc)
 
 
 async def _setup_bot_commands(app: Application) -> None:
@@ -1820,6 +1716,20 @@ async def _setup_bot_commands(app: Application) -> None:
         logger.info("Registered %d active Telegram bot commands.", len(BOT_COMMANDS))
     except Exception as exc:
         logger.warning("Could not register bot commands with Telegram: %s", exc)
+
+    try:
+        from telegram import MenuButtonCommands, MenuButtonWebApp
+        if getattr(config, "MINI_APP_URL", "") and config.MINI_APP_URL.startswith("https://"):
+            await app.bot.set_chat_menu_button(
+                menu_button=MenuButtonWebApp(text="Dashboard", web_app=WebAppInfo(url=config.MINI_APP_URL))
+            )
+        else:
+            await app.bot.set_chat_menu_button(
+                menu_button=MenuButtonCommands()
+            )
+        logger.info("Configured native Telegram Menu Button.")
+    except Exception as exc:
+        logger.warning("Could not set chat menu button: %s", exc)
 
     try:
         bot_desc = (
@@ -1860,7 +1770,17 @@ async def _post_init(app: Application) -> None:
 
 
 async def _post_shutdown(app: Application) -> None:
-    """Graceful shutdown hook to cleanly stop WorkloadManager and workers."""
+    """Graceful shutdown hook to cleanly stop WebApp server, WorkloadManager, and workers."""
+    server = app.bot_data.get("_fastapi_server")
+    if server:
+        logger.info("Stopping FastAPI WebApp server...")
+        server.should_exit = True
+    task = app.bot_data.get("_fastapi_task")
+    if task and not task.done():
+        try:
+            await asyncio.wait_for(task, timeout=3.0)
+        except Exception:
+            pass
     logger.info("Bot is shutting down, stopping WorkloadManager...")
     await workload_manager.stop()
 

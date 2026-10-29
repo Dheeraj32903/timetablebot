@@ -447,6 +447,90 @@ def parse_timetable_sections(html: str, day_filter: Optional[str] = None) -> Lis
     return sections
 
 
+def parse_timetable_structured(html: str) -> List[dict]:
+    """
+    Parse ERP timetable HTML into structured JSON dictionaries compatible with Mini App schemas.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    for tag in soup(["script", "style", "nav", "header", "footer"]):
+        tag.decompose()
+
+    tables = soup.find_all("table")
+    if not tables:
+        return []
+
+    best_table = max(tables, key=lambda t: len(t.find_all(["td", "th"])))
+    grid = _parse_table_to_grid(best_table)
+    if not grid:
+        return []
+
+    header_idx, data_indices = _find_header_and_data_rows(grid)
+    header = grid[header_idx] if header_idx < len(grid) else []
+    grid = _drop_empty_columns(grid, data_indices)
+
+    header_idx, data_indices = _find_header_and_data_rows(grid)
+    header = grid[header_idx] if header_idx < len(grid) else []
+    col_headers = header[1:] if len(header) > 1 else []
+
+    today_short = _today_day_name()
+    days_result = []
+
+    for r in data_indices:
+        row = grid[r]
+        if not row:
+            continue
+        first_cell = row[0] if len(row) > 0 else ""
+        if not _is_day_name(first_cell):
+            continue
+        norm_day = _normalize_day_name(first_cell)
+        full_day_name = _DAY_FULL_NAMES.get(norm_day, norm_day)
+        periods = row[1:]
+
+        classes_list = []
+        i = 0
+        while i < len(periods):
+            cell = periods[i].strip()
+            period_label = col_headers[i] if i < len(col_headers) else str(i + 1)
+            if not cell or cell == "-":
+                i += 1
+                continue
+
+            j = i + 1
+            while j < len(periods) and periods[j].strip() == cell:
+                j += 1
+
+            end_label = col_headers[j - 1] if j - 1 < len(col_headers) else str(j)
+            time_start_str = _slot_time_range(period_label).split("-")[0]
+            time_end_str = _slot_time_range(end_label).split("-")[-1]
+
+            parsed = _parse_period_cell(cell)
+            raw_subj = parsed["subject"]
+            course_title = _get_course_title(raw_subj) or raw_subj
+            _, type_label = _get_type_info(raw_subj)
+
+            classes_list.append({
+                "slot_label": f"Slot {period_label}" if i == j - 1 else f"Slots {period_label}-{end_label}",
+                "start_time": time_start_str,
+                "end_time": time_end_str,
+                "subject_code": raw_subj,
+                "subject_title": course_title,
+                "class_type": type_label,
+                "room": parsed["room"] or "TBA",
+                "section": parsed["section"] or "—",
+            })
+            i = j
+
+        days_result.append({
+            "day": norm_day,
+            "full_day_name": full_day_name,
+            "total_classes": len(classes_list),
+            "is_today": (norm_day.lower() == today_short.lower()),
+            "classes": classes_list,
+        })
+
+    return days_result
+
+
 def parse_timetable_html(html: str, day_filter: Optional[str] = None) -> str:
     """
     Parse the ERP timetable HTML and return an aesthetically formatted string.
