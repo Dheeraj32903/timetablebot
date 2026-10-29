@@ -42,6 +42,7 @@ from parser.timetable import (
     format_timetable_for_telegram,
     get_timetable_messages,
     _today_day_name,
+    _normalize_day_name,
     resolve_day_name,
 )
 from lms.client import LMSClient
@@ -99,6 +100,7 @@ def is_authorized(update: Update) -> bool:
 
 
 BOT_COMMANDS = [
+    BotCommand("menu", "Main dashboard & quick action menu"),
     BotCommand("timetable", "Today's classes, timings & rooms"),
     BotCommand("week", "Full weekly timetable view"),
     BotCommand("submissions", "Pending assignments & LMS deadlines"),
@@ -107,12 +109,101 @@ BOT_COMMANDS = [
     BotCommand("login", "Connect & save ERP credentials"),
     BotCommand("lms_login", "Connect & save LMS credentials"),
     BotCommand("lms_logout", "Disconnect LMS credentials"),
-    BotCommand("morning", "Sends the day's schedule daily at 7 AM"),
-    BotCommand("status", "Check ERP connection status"),
+    BotCommand("morning", "Toggle daily morning schedule alert"),
+    BotCommand("status", "Check ERP & LMS account status"),
     BotCommand("description", "Why use this bot & key benefits"),
     BotCommand("privacy", "View bot privacy policy"),
     BotCommand("logout", "Log out ERP & clear your data"),
 ]
+
+WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+
+
+def get_timetable_keyboard(current_day: str) -> InlineKeyboardMarkup:
+    """Generate dynamic day pagination inline keyboard."""
+    norm_day = _normalize_day_name(current_day)
+    try:
+        curr_idx = WEEKDAYS.index(norm_day)
+    except ValueError:
+        curr_idx = 0
+    prev_day = WEEKDAYS[(curr_idx - 1) % len(WEEKDAYS)]
+    next_day = WEEKDAYS[(curr_idx + 1) % len(WEEKDAYS)]
+
+    row1 = [
+        InlineKeyboardButton(f"◀️ {prev_day}", callback_data=f"tt:day:{prev_day}"),
+        InlineKeyboardButton(f"• {norm_day} •", callback_data=f"tt:refresh:{norm_day}"),
+        InlineKeyboardButton(f"{next_day} ▶️", callback_data=f"tt:day:{next_day}"),
+    ]
+    row2 = [
+        InlineKeyboardButton("📅 Today", callback_data=f"tt:day:{_today_day_name()}"),
+        InlineKeyboardButton("🗓️ Full Week", callback_data="tt:week"),
+        InlineKeyboardButton("🔄 Refresh", callback_data=f"tt:refresh:{norm_day}"),
+    ]
+    row3 = [
+        InlineKeyboardButton("🏠 Main Dashboard", callback_data="menu:open"),
+    ]
+    return InlineKeyboardMarkup([row1, row2, row3])
+
+
+def _build_dashboard_payload(user_id: int, first_name: str = "Student") -> Tuple[str, InlineKeyboardMarkup]:
+    """Generate an interactive, stateful student hub dashboard."""
+    saved_erp = credentials.load_user_credentials(user_id)
+    saved_lms = credentials.load_user_lms_credentials(user_id)
+    erp_session = load_session(user_id=user_id)
+    morning_on = storage.is_user_morning_enabled(user_id)
+
+    # ERP status badge
+    if saved_erp and erp_session and erp_session.get("cookies"):
+        erp_badge = f"🟢 <b>Active</b> (<code>{html_lib.escape(saved_erp.get('username', ''))}</code>)"
+    elif saved_erp:
+        erp_badge = f"🟡 <b>Stored</b> (<code>{html_lib.escape(saved_erp.get('username', ''))}</code>)"
+    else:
+        erp_badge = "🔴 <b>Not Connected</b> (/login)"
+
+    # LMS status badge
+    if saved_lms:
+        lms_badge = f"🟢 <b>Connected</b> (<code>{html_lib.escape(saved_lms.get('username', ''))}</code>)"
+    else:
+        lms_badge = "⚪ <b>Not Connected</b> (/lms_login)"
+
+    # Morning alert badge
+    if morning_on:
+        morning_badge = f"🔔 <b>Enabled</b> (Daily {config.MORNING_TIMETABLE_HOUR:02d}:{config.MORNING_TIMETABLE_MINUTE:02d} IST)"
+    else:
+        morning_badge = "🔕 <b>Disabled</b>"
+
+    name_escaped = html_lib.escape(first_name or "Student")
+    text = (
+        f"🎓 <b>Welcome, {name_escaped}!</b>\n"
+        f"<i>KL University Smart Academic Hub</i>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🏫 <b>ERP Schedule:</b> {erp_badge}\n"
+        f"📚 <b>Moodle LMS:</b> {lms_badge}\n"
+        f"⏰ <b>Morning Dispatch:</b> {morning_badge}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👇 <b>Quick Actions:</b>"
+    )
+
+    buttons = [
+        [
+            InlineKeyboardButton("📅 Today's Classes", callback_data=f"menu:timetable:{_today_day_name()}"),
+            InlineKeyboardButton("🗓️ Weekly Timetable", callback_data="menu:week"),
+        ],
+        [
+            InlineKeyboardButton("📋 LMS Submissions", callback_data="menu:submissions"),
+            InlineKeyboardButton("🏠 Hostel Outpass", callback_data="menu:outpass"),
+        ],
+        [
+            InlineKeyboardButton("👥 Friend Schedule", callback_data="menu:friend"),
+            InlineKeyboardButton("🔔 Toggle Morning Alert", callback_data="menu:morning_toggle"),
+        ],
+        [
+            InlineKeyboardButton("📊 Account & Status", callback_data="menu:status"),
+            InlineKeyboardButton("❓ Help & Commands", callback_data="menu:help"),
+        ]
+    ]
+
+    return text, InlineKeyboardMarkup(buttons)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -139,24 +230,32 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception:
             pass
 
-    welcome_text = (
-        "🎓 <b>Your KL University Assistant welcomes you!</b>\n\n"
-        "Timetable, ERP schedule &amp; LMS pending submissions — all in one place.\n\n"
-        "✨ <b>What you can do:</b>\n\n"
-        "📅 Check today's classes &amp; room numbers (<code>/timetable</code>)\n\n"
-        "🗓️ View your full weekly timetable (<code>/week</code>)\n\n"
-        "📋 <b>Track pending LMS HAs, ALMs &amp; deadlines</b> (<code>/submissions</code>)\n\n"
-        "🏠 <b>Check hostel outpass status &amp; apply for e-outing</b> (<code>/outpass</code>)\n\n"
-        "⏰ Get daily morning schedule alerts (<code>/morning</code>)\n\n"
-        "👥 Check your friends' schedules (<code>/friend</code>)\n\n"
-        "👇 Tap the Menu button below ( or ) Type  /  to view commands"
-    )
-
+    text, markup = _build_dashboard_payload(uid, user.first_name if user else "Student")
     if update.message:
         await update.message.reply_text(
-            welcome_text,
+            text,
             parse_mode="HTML",
+            reply_markup=markup,
         )
+
+
+async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Open the interactive student hub dashboard."""
+    if not is_authorized(update):
+        await update.effective_message.reply_text("⛔ You are not authorized to use this bot.")
+        return
+
+    user = update.effective_user
+    uid = user.id if user else None
+    if not uid:
+        return
+
+    text, markup = _build_dashboard_payload(uid, user.first_name if user else "Student")
+    await update.effective_message.reply_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=markup,
+    )
 
 
 async def _run_login(update: Update, username: str, password: str) -> None:
@@ -816,15 +915,19 @@ async def timetable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             uid,
         )
 
+        context.user_data["last_timetable_html"] = html
+        context.user_data["last_timetable_time"] = time.time()
+
         messages = get_timetable_messages(html, day_filter=day)
         if not messages:
             await status_msg.edit_text("⚠️ <i>Could not extract timetable. Please check in ERP.</i>", parse_mode="HTML")
             return
 
-        # Send timetable directly without inline buttons
+        kb = get_timetable_keyboard(day)
         await status_msg.edit_text(
             messages[0],
             parse_mode="HTML",
+            reply_markup=kb,
         )
         for extra_msg in messages[1:]:
             await update.message.reply_text(extra_msg, parse_mode="HTML")
@@ -872,15 +975,27 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             uid,
         )
 
+        context.user_data["last_timetable_html"] = html
+        context.user_data["last_timetable_time"] = time.time()
+
         messages = get_timetable_messages(html)
         if not messages:
             await status_msg.edit_text("⚠️ <i>Could not extract timetable. Please check in ERP.</i>", parse_mode="HTML")
             return
 
-        # Send full week timetable directly without inline buttons
+        week_kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(f"📅 View Today ({_today_day_name()})", callback_data=f"tt:day:{_today_day_name()}"),
+                InlineKeyboardButton("🔄 Refresh Week", callback_data="tt:week"),
+            ],
+            [
+                InlineKeyboardButton("🏠 Main Dashboard", callback_data="menu:open"),
+            ]
+        ])
         await status_msg.edit_text(
             messages[0],
             parse_mode="HTML",
+            reply_markup=week_kb,
         )
         for extra_msg in messages[1:]:
             await update.message.reply_text(extra_msg, parse_mode="HTML")
@@ -1161,6 +1276,71 @@ async def morning(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+def _build_status_payload(user_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+    """Generate a rich, interactive account and integration status dashboard."""
+    saved_erp = credentials.load_user_credentials(user_id)
+    saved_lms = credentials.load_user_lms_credentials(user_id)
+    erp_session = load_session(user_id=user_id)
+    morning_on = storage.is_user_morning_enabled(user_id)
+
+    if saved_erp:
+        has_cookies = bool(erp_session and erp_session.get("cookies"))
+        cookie_stat = "Active Live Session" if has_cookies else "Session Expired (Auto re-login ready)"
+        erp_status_line = f"🟢 <b>Connected</b> (<code>{html_lib.escape(saved_erp.get('username', ''))}</code>)\n   └ <i>{cookie_stat}</i>"
+    else:
+        erp_status_line = "🔴 <b>Disconnected</b> (Use /login to link account)"
+
+    if saved_lms:
+        lms_status_line = f"🟢 <b>Connected</b> (<code>{html_lib.escape(saved_lms.get('username', ''))}</code>)\n   └ <i>Moodle Token Active</i>"
+    else:
+        lms_status_line = "⚪ <b>Disconnected</b> (Use /lms_login to link account)"
+
+    if morning_on:
+        morning_status_line = f"🔔 <b>Enabled</b> (Daily {config.MORNING_TIMETABLE_HOUR:02d}:{config.MORNING_TIMETABLE_MINUTE:02d} IST)"
+        morning_btn = InlineKeyboardButton("🔕 Disable Morning Alert", callback_data="status:toggle_morning")
+    else:
+        morning_status_line = "🔕 <b>Disabled</b>"
+        morning_btn = InlineKeyboardButton("🔔 Enable Morning Alert", callback_data="status:toggle_morning")
+
+    text = (
+        "📊 <b>Account & Integration Status</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🆔 <b>Telegram ID:</b> <code>{user_id}</code>\n\n"
+        f"🏫 <b>University ERP:</b>\n{erp_status_line}\n\n"
+        f"📚 <b>Moodle LMS:</b>\n{lms_status_line}\n\n"
+        f"⏰ <b>Morning Dispatch:</b>\n{morning_status_line}\n\n"
+        f"🔐 <b>Storage Encryption:</b>\n🛡️ Authenticated Fernet (AES-128-CBC + HMAC-SHA256)\n"
+        "━━━━━━━━━━━━━━━━━━━━━━"
+    )
+
+    buttons = [
+        [
+            InlineKeyboardButton("🔄 Refresh Status", callback_data="status:refresh"),
+            morning_btn,
+        ],
+    ]
+
+    action_row = []
+    if not saved_erp:
+        action_row.append(InlineKeyboardButton("🔑 Connect ERP", callback_data="status:login"))
+    else:
+        action_row.append(InlineKeyboardButton("🚪 Log Out ERP", callback_data="status:logout_erp"))
+
+    if not saved_lms:
+        action_row.append(InlineKeyboardButton("📚 Connect LMS", callback_data="status:lms_login"))
+    else:
+        action_row.append(InlineKeyboardButton("🚪 Disconnect LMS", callback_data="status:logout_lms"))
+
+    if action_row:
+        buttons.append(action_row)
+
+    buttons.append([
+        InlineKeyboardButton("🏠 Main Dashboard", callback_data="menu:open"),
+    ])
+
+    return text, InlineKeyboardMarkup(buttons)
+
+
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
         await update.message.reply_text("⛔ You are not authorized to use this bot.")
@@ -1168,12 +1348,345 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     user = update.effective_user
     uid = user.id if user else None
-    session = load_session(user_id=uid)
-    
-    if session and session.get("cookies"):
-        await update.message.reply_text("✅ <b>Logged In:</b> Your ERP session is active.", parse_mode="HTML")
-    else:
-        await update.message.reply_text("❌ <b>Logged Out:</b> Use /login to connect your ERP account.", parse_mode="HTML")
+    if not uid:
+        return
+
+    text, markup = _build_status_payload(uid)
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
+
+
+async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle interactions from the main dashboard inline buttons."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user = update.effective_user
+    uid = user.id if user else None
+    if not uid or not is_authorized(update):
+        return
+
+    if data == "menu:open":
+        text, markup = _build_dashboard_payload(uid, user.first_name if user else "Student")
+        try:
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+        except Exception:
+            pass
+        return
+
+    if data.startswith("menu:timetable:"):
+        target_day = data.split(":", 2)[2]
+        await query.edit_message_text("⏳ <i>Loading timetable...</i>", parse_mode="HTML")
+        try:
+            html = await workload_manager.submit_job(
+                workload_manager.timetable_queue,
+                uid,
+                "fetch_timetable",
+                "timetable",
+                _fetch_live_timetable_job,
+                uid,
+            )
+            context.user_data["last_timetable_html"] = html
+            context.user_data["last_timetable_time"] = time.time()
+            messages = get_timetable_messages(html, day_filter=target_day)
+            kb = get_timetable_keyboard(target_day)
+            await query.edit_message_text(messages[0] if messages else "⚠️ <i>Empty schedule</i>", parse_mode="HTML", reply_markup=kb)
+        except Exception as exc:
+            await query.edit_message_text(f"⚠️ <i>Could not load timetable: {html_lib.escape(str(exc))}</i>", parse_mode="HTML")
+        return
+
+    if data == "menu:week":
+        await query.edit_message_text("⏳ <i>Loading full week timetable...</i>", parse_mode="HTML")
+        try:
+            html = await workload_manager.submit_job(
+                workload_manager.timetable_queue,
+                uid,
+                "fetch_week_timetable",
+                "timetable",
+                _fetch_live_timetable_job,
+                uid,
+            )
+            context.user_data["last_timetable_html"] = html
+            context.user_data["last_timetable_time"] = time.time()
+            messages = get_timetable_messages(html)
+            week_kb = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(f"📅 View Today ({_today_day_name()})", callback_data=f"tt:day:{_today_day_name()}"),
+                    InlineKeyboardButton("🔄 Refresh Week", callback_data="tt:week"),
+                ],
+                [
+                    InlineKeyboardButton("🏠 Main Dashboard", callback_data="menu:open"),
+                ]
+            ])
+            await query.edit_message_text(messages[0] if messages else "⚠️ <i>Empty schedule</i>", parse_mode="HTML", reply_markup=week_kb)
+            for extra in messages[1:]:
+                await context.bot.send_message(chat_id=uid, text=extra, parse_mode="HTML")
+        except Exception as exc:
+            await query.edit_message_text(f"⚠️ <i>Could not load week timetable: {html_lib.escape(str(exc))}</i>", parse_mode="HTML")
+        return
+
+    if data == "menu:submissions":
+        saved_lms = credentials.load_user_lms_credentials(uid)
+        if not saved_lms:
+            connect_kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔗 Connect LMS Account", callback_data="status:lms_login")],
+                [InlineKeyboardButton("🏠 Main Dashboard", callback_data="menu:open")],
+            ])
+            await query.edit_message_text(
+                "<b>LMS Not Connected</b>\n\n"
+                "Please connect your KL Moodle LMS account first to view your pending submissions and deadlines.",
+                parse_mode="HTML",
+                reply_markup=connect_kb,
+            )
+            return
+
+        await query.edit_message_text("⏳ <i>Fetching pending submissions from LMS...</i>", parse_mode="HTML")
+        await _send_lms_pending_tasks(update, context, uid, message_to_edit=query.message, force_refresh=False)
+        return
+
+    if data == "menu:outpass":
+        outpass_greeting = (
+            "🏠 <b>Hostel Outpass Services</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Apply for digital hostel gate outing passes with instant warden routing.\n\n"
+            "Send /outpass in chat to start the step-by-step application, or check your past requests."
+        )
+        back_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Apply via /outpass", callback_data="menu:open")],
+            [InlineKeyboardButton("🏠 Main Dashboard", callback_data="menu:open")],
+        ])
+        await query.edit_message_text(outpass_greeting, parse_mode="HTML", reply_markup=back_kb)
+        return
+
+    if data == "menu:friend":
+        context.user_data["friend_login"] = True
+        context.user_data["login_state"] = STATE_WAITING_USERNAME
+        cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="menu:open")]])
+        await query.edit_message_text(
+            "👥 <b>Friend's Timetable Lookup</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            "Please send your friend's ERP <b>username / Student ID</b>:\n\n"
+            "<i>(Their credentials will be used once in-memory and will never be saved to database)</i>",
+            parse_mode="HTML",
+            reply_markup=cancel_kb,
+        )
+        return
+
+    if data == "menu:morning_toggle":
+        is_on = storage.is_user_morning_enabled(uid)
+        storage.set_user_morning_enabled(uid, not is_on)
+        if not is_on:
+            _schedule_morning_timetable_job(context)
+            await query.answer("🔔 Daily morning alerts enabled at 06:45 AM IST!", show_alert=False)
+        else:
+            await query.answer("🔕 Daily morning alerts disabled.", show_alert=False)
+        text, markup = _build_dashboard_payload(uid, user.first_name if user else "Student")
+        try:
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+        except Exception:
+            pass
+        return
+
+    if data == "menu:status":
+        text, markup = _build_status_payload(uid)
+        try:
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+        except Exception:
+            pass
+        return
+
+    if data == "menu:help":
+        help_text = (
+            "📖 <b>KL University Assistant Guide</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "• <code>/menu</code> — Open interactive dashboard\n"
+            "• <code>/timetable [day]</code> — Live classes & rooms\n"
+            "• <code>/week</code> — Full weekly timetable schedule\n"
+            "• <code>/submissions</code> — LMS tasks & upcoming deadlines\n"
+            "• <code>/outpass</code> — Hostel outing status & request\n"
+            "• <code>/friend</code> — Look up friend's schedule\n"
+            "• <code>/morning</code> — Toggle 7:00 AM daily alerts\n"
+            "• <code>/login</code> — Connect ERP student account\n"
+            "• <code>/lms_login</code> — Connect Moodle LMS account\n"
+            "• <code>/status</code> — Account and integration status\n"
+            "• <code>/privacy</code> — Privacy & encryption policy\n"
+            "• <code>/logout</code> — Log out ERP and purge data\n"
+            "━━━━━━━━━━━━━━━━━━━━━━"
+        )
+        back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Back to Dashboard", callback_data="menu:open")]])
+        await query.edit_message_text(help_text, parse_mode="HTML", reply_markup=back_kb)
+        return
+
+
+async def handle_timetable_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle day switching, week view, and timetable refreshing from inline buttons."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user = update.effective_user
+    uid = user.id if user else None
+    if not uid or not is_authorized(update):
+        return
+
+    if data.startswith("tt:day:"):
+        target_day = data.split(":", 2)[2]
+        html = context.user_data.get("last_timetable_html")
+        cached_time = context.user_data.get("last_timetable_time", 0)
+
+        if not html or (time.time() - cached_time > 600):
+            try:
+                html = await workload_manager.submit_job(
+                    workload_manager.timetable_queue,
+                    uid,
+                    "fetch_timetable",
+                    "timetable",
+                    _fetch_live_timetable_job,
+                    uid,
+                )
+                context.user_data["last_timetable_html"] = html
+                context.user_data["last_timetable_time"] = time.time()
+            except Exception as exc:
+                await query.edit_message_text(f"⚠️ <i>Could not load timetable: {html_lib.escape(str(exc))}</i>", parse_mode="HTML")
+                return
+
+        messages = get_timetable_messages(html, day_filter=target_day)
+        kb = get_timetable_keyboard(target_day)
+        try:
+            await query.edit_message_text(messages[0] if messages else "🏖️ <i>No classes found for this day.</i>", parse_mode="HTML", reply_markup=kb)
+        except Exception:
+            pass
+        return
+
+    if data.startswith("tt:refresh:"):
+        target_day = data.split(":", 2)[2]
+        try:
+            await query.edit_message_text("🔄 <i>Refreshing live timetable from ERP...</i>", parse_mode="HTML")
+            html = await workload_manager.submit_job(
+                workload_manager.timetable_queue,
+                uid,
+                "fetch_timetable",
+                "timetable",
+                _fetch_live_timetable_job,
+                uid,
+            )
+            context.user_data["last_timetable_html"] = html
+            context.user_data["last_timetable_time"] = time.time()
+            messages = get_timetable_messages(html, day_filter=target_day)
+            kb = get_timetable_keyboard(target_day)
+            await query.edit_message_text(messages[0] if messages else "🏖️ <i>No classes found for this day.</i>", parse_mode="HTML", reply_markup=kb)
+        except Exception as exc:
+            await query.edit_message_text(f"⚠️ <i>Failed to refresh timetable: {html_lib.escape(str(exc))}</i>", parse_mode="HTML")
+        return
+
+    if data == "tt:week":
+        html = context.user_data.get("last_timetable_html")
+        cached_time = context.user_data.get("last_timetable_time", 0)
+        if not html or (time.time() - cached_time > 600):
+            try:
+                await query.edit_message_text("⏳ <i>Fetching full week timetable...</i>", parse_mode="HTML")
+                html = await workload_manager.submit_job(
+                    workload_manager.timetable_queue,
+                    uid,
+                    "fetch_week_timetable",
+                    "timetable",
+                    _fetch_live_timetable_job,
+                    uid,
+                )
+                context.user_data["last_timetable_html"] = html
+                context.user_data["last_timetable_time"] = time.time()
+            except Exception as exc:
+                await query.edit_message_text(f"⚠️ <i>Could not load week timetable: {html_lib.escape(str(exc))}</i>", parse_mode="HTML")
+                return
+
+        messages = get_timetable_messages(html)
+        week_kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(f"📅 View Today ({_today_day_name()})", callback_data=f"tt:day:{_today_day_name()}"),
+                InlineKeyboardButton("🔄 Refresh Week", callback_data="tt:week"),
+            ],
+            [
+                InlineKeyboardButton("🏠 Main Dashboard", callback_data="menu:open"),
+            ]
+        ])
+        try:
+            await query.edit_message_text(messages[0], parse_mode="HTML", reply_markup=week_kb)
+            for extra in messages[1:]:
+                await context.bot.send_message(chat_id=uid, text=extra, parse_mode="HTML")
+        except Exception:
+            pass
+        return
+
+
+async def handle_status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle interactions from the status dashboard inline buttons."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user = update.effective_user
+    uid = user.id if user else None
+    if not uid or not is_authorized(update):
+        return
+
+    if data == "status:refresh":
+        text, markup = _build_status_payload(uid)
+        try:
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+        except Exception:
+            pass
+        return
+
+    if data == "status:toggle_morning":
+        is_on = storage.is_user_morning_enabled(uid)
+        storage.set_user_morning_enabled(uid, not is_on)
+        if not is_on:
+            _schedule_morning_timetable_job(context)
+            await query.answer("🔔 Daily morning alerts enabled at 06:45 AM IST!", show_alert=False)
+        else:
+            await query.answer("🔕 Daily morning alerts disabled.", show_alert=False)
+        text, markup = _build_status_payload(uid)
+        try:
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+        except Exception:
+            pass
+        return
+
+    if data == "status:login":
+        context.user_data["login_state"] = STATE_WAITING_USERNAME
+        await query.message.reply_text("🔑 Please send your ERP username / Student ID:")
+        return
+
+    if data == "status:lms_login":
+        context.user_data["login_state"] = STATE_WAITING_LMS_USERNAME
+        await query.message.reply_text("📚 Please send your LMS username / Student ID:")
+        return
+
+    if data == "status:logout_erp":
+        try:
+            reset_user_client(uid)
+            credentials.delete_user_credentials(uid)
+            storage.delete_user_session(uid)
+            await query.answer("Logged out of ERP successfully.", show_alert=False)
+        except Exception as e:
+            logger.error("Error logging out ERP: %s", e)
+        text, markup = _build_status_payload(uid)
+        try:
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+        except Exception:
+            pass
+        return
+
+    if data == "status:logout_lms":
+        try:
+            credentials.delete_user_lms_credentials(uid)
+            LMSService.invalidate_user_cache(uid)
+            await query.answer("Disconnected LMS account.", show_alert=False)
+        except Exception as e:
+            logger.error("Error logging out LMS: %s", e)
+        text, markup = _build_status_payload(uid)
+        try:
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+        except Exception:
+            pass
+        return
 
 
 async def privacy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1376,6 +1889,8 @@ def main() -> None:
     application.add_handler(TypeHandler(Update, security.anti_flood_middleware), group=-1)
 
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("menu", menu_command))
+    application.add_handler(CommandHandler("dashboard", menu_command))
     application.add_handler(CommandHandler("login", login))
     application.add_handler(CommandHandler("friend", friend))
     application.add_handler(CommandHandler("timetable", timetable))
@@ -1391,6 +1906,9 @@ def main() -> None:
     application.add_handler(CommandHandler("describe", description))
     application.add_handler(CommandHandler("privacy", privacy))
     application.add_handler(CommandHandler("logout", logout))
+    application.add_handler(CallbackQueryHandler(handle_menu_callback, pattern=r"^menu:"))
+    application.add_handler(CallbackQueryHandler(handle_timetable_callback, pattern=r"^tt:"))
+    application.add_handler(CallbackQueryHandler(handle_status_callback, pattern=r"^status:"))
     application.add_handler(CallbackQueryHandler(handle_lms_callback, pattern=r"^lms:"))
     application.add_handler(CallbackQueryHandler(handle_outpass_callback, pattern=r"^(outpass|outcal)"))
     application.add_handler(ChatMemberHandler(handle_user_status_change, ChatMemberHandler.MY_CHAT_MEMBER))
