@@ -16,9 +16,8 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Update,
-    WebAppInfo,
 )
-from telegram.constants import ChatMemberStatus
+from telegram.constants import ChatAction, ChatMemberStatus
 from telegram.ext import (
     AIORateLimiter,
     Application,
@@ -38,7 +37,7 @@ import config
 import credentials
 import security
 import storage
-from erp.session import perform_login, fetch_timetable_html, load_session
+from erp.session import perform_login, fetch_timetable_html, load_session, warm_active_sessions
 from erp.client import auto_login, reset_user_client
 from parser.timetable import (
     format_timetable_for_telegram,
@@ -633,15 +632,16 @@ async def submissions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
             return
 
-        # Check for warm in-memory cache for ultra-fast instant rendering
-        now = time.time()
-        cached = LMSService._task_cache.get(user.id)
-        if cached and (now - cached[0] < 120):
-            await _send_lms_pending_tasks(update, context, user.id, force_refresh=False)
-            return
+        # Instant UX feedback within 50ms
+        if update.effective_chat:
+            try:
+                await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+            except Exception:
+                pass
 
-        status_msg = await update.message.reply_text("⏳ <b>Fetching your submissions from LMS...</b>", parse_mode="HTML")
-        await workload_manager.submit_job(
+        status_msg = await update.message.reply_text("⚡ <i>Fetching live LMS submissions...</i>", parse_mode="HTML")
+        await workload_manager.submit_coalesced_job(
+            (user.id, "lms_tasks"),
             workload_manager.lms_queue,
             user.id,
             "fetch_lms_tasks",
@@ -651,7 +651,7 @@ async def submissions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             context,
             user.id,
             message_to_edit=status_msg,
-            force_refresh=False,
+            force_refresh=True,
         )
 
 
@@ -844,14 +844,7 @@ def _schedule_lms_alerts_job(application: Application) -> None:
 
 async def _fetch_live_timetable_job(uid: int, metric=None) -> str:
     """Worker job handler to fetch live timetable from ERP (silent re-auth if needed)."""
-    try:
-        return await fetch_timetable_html(user_id=uid)
-    except Exception:
-        saved = credentials.load_user_credentials(uid)
-        if not saved:
-            raise RuntimeError("No active ERP session. Please log in using /login first.")
-        await perform_login(saved["username"], saved["password"], user_id=uid)
-        return await fetch_timetable_html(user_id=uid)
+    return await fetch_timetable_html(user_id=uid, metric=metric)
 
 
 async def timetable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -873,10 +866,18 @@ async def timetable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not uid:
         return
 
-    status_msg = await update.message.reply_text("⏳ Fetching your live timetable from ERP...")
+    # Instant UX feedback within 50ms
+    if update.effective_chat:
+        try:
+            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+        except Exception:
+            pass
+
+    status_msg = await update.message.reply_text("⚡ <i>Fetching live data from ERP...</i>", parse_mode="HTML")
 
     try:
-        html = await workload_manager.submit_job(
+        html = await workload_manager.submit_coalesced_job(
+            (uid, "timetable"),
             workload_manager.timetable_queue,
             uid,
             "fetch_timetable",
@@ -933,10 +934,18 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not uid:
         return
 
-    status_msg = await update.message.reply_text("⏳ Fetching your full week timetable from ERP...")
+    # Instant UX feedback within 50ms
+    if update.effective_chat:
+        try:
+            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+        except Exception:
+            pass
+
+    status_msg = await update.message.reply_text("⚡ <i>Fetching live week timetable from ERP...</i>", parse_mode="HTML")
 
     try:
-        html = await workload_manager.submit_job(
+        html = await workload_manager.submit_coalesced_job(
+            (uid, "week_timetable"),
             workload_manager.timetable_queue,
             uid,
             "fetch_week_timetable",
@@ -1085,7 +1094,12 @@ async def _send_morning_timetable(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info("Morning timetable skipped: no users with morning alerts enabled.")
         return
 
+    today_str = datetime.now().strftime("%Y-%m-%d")
     for chat_id in morning_uids:
+        if storage.has_morning_alert_sent_today(chat_id, today_str):
+            logger.info("Morning alert already sent today (%s) to %s, skipping.", today_str, chat_id)
+            continue
+
         # Tier 1: In-memory RAM cache
         html = _morning_cache.get(chat_id)
 
@@ -1118,6 +1132,7 @@ async def _send_morning_timetable(context: ContextTypes.DEFAULT_TYPE) -> None:
                         text=f"{header}{chunk}",
                         parse_mode="HTML",
                     )
+                storage.record_morning_alert_sent(chat_id, today_str)
                 logger.info("Dispatched morning timetable to outbox for chat_id=%s (%d parts)", chat_id, len(messages))
             except Exception as e:
                 logger.exception("Error formatting morning timetable for chat_id=%s: %s", chat_id, e)
@@ -1127,6 +1142,7 @@ async def _send_morning_timetable(context: ContextTypes.DEFAULT_TYPE) -> None:
                 text="⚠️ <b>Unable to fetch live timetable from ERP this morning.</b>\nPlease check directly in the ERP portal.",
                 parse_mode="HTML",
             )
+            storage.record_morning_alert_sent(chat_id, today_str)
 
     # Clear memory cache after delivery
     _morning_cache.clear()
@@ -1309,9 +1325,10 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if data.startswith("menu:timetable:"):
         target_day = data.split(":", 2)[2]
-        await query.edit_message_text("⏳ <i>Loading timetable...</i>", parse_mode="HTML")
+        await query.edit_message_text("⚡ <i>Fetching live data from ERP...</i>", parse_mode="HTML")
         try:
-            html = await workload_manager.submit_job(
+            html = await workload_manager.submit_coalesced_job(
+                (uid, "timetable"),
                 workload_manager.timetable_queue,
                 uid,
                 "fetch_timetable",
@@ -1329,9 +1346,10 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if data == "menu:week":
-        await query.edit_message_text("⏳ <i>Loading full week timetable...</i>", parse_mode="HTML")
+        await query.edit_message_text("⚡ <i>Fetching live week timetable from ERP...</i>", parse_mode="HTML")
         try:
-            html = await workload_manager.submit_job(
+            html = await workload_manager.submit_coalesced_job(
+                (uid, "week_timetable"),
                 workload_manager.timetable_queue,
                 uid,
                 "fetch_week_timetable",
@@ -1360,8 +1378,20 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             )
             return
 
-        await query.edit_message_text("⏳ <i>Fetching pending submissions from LMS...</i>", parse_mode="HTML")
-        await _send_lms_pending_tasks(update, context, uid, message_to_edit=query.message, force_refresh=False)
+        await query.edit_message_text("⚡ <i>Fetching live submissions from LMS...</i>", parse_mode="HTML")
+        await workload_manager.submit_coalesced_job(
+            (uid, "lms_tasks"),
+            workload_manager.lms_queue,
+            uid,
+            "fetch_lms_tasks",
+            "lms",
+            _send_lms_pending_tasks,
+            update,
+            context,
+            uid,
+            message_to_edit=query.message,
+            force_refresh=True,
+        )
         return
 
     if data == "menu:outpass":
@@ -1448,9 +1478,11 @@ async def handle_timetable_callback(update: Update, context: ContextTypes.DEFAUL
         html = context.user_data.get("last_timetable_html")
         cached_time = context.user_data.get("last_timetable_time", 0)
 
-        if not html or (time.time() - cached_time > 600):
+        if not html or (time.time() - cached_time > 60):
             try:
-                html = await workload_manager.submit_job(
+                await query.edit_message_text("⚡ <i>Fetching live timetable from ERP...</i>", parse_mode="HTML")
+                html = await workload_manager.submit_coalesced_job(
+                    (uid, "timetable"),
                     workload_manager.timetable_queue,
                     uid,
                     "fetch_timetable",
@@ -1475,8 +1507,9 @@ async def handle_timetable_callback(update: Update, context: ContextTypes.DEFAUL
     if data.startswith("tt:refresh:"):
         target_day = data.split(":", 2)[2]
         try:
-            await query.edit_message_text("🔄 <i>Refreshing live timetable from ERP...</i>", parse_mode="HTML")
-            html = await workload_manager.submit_job(
+            await query.edit_message_text("⚡ <i>Refreshing live timetable from ERP...</i>", parse_mode="HTML")
+            html = await workload_manager.submit_coalesced_job(
+                (uid, "timetable"),
                 workload_manager.timetable_queue,
                 uid,
                 "fetch_timetable",
@@ -1494,24 +1527,22 @@ async def handle_timetable_callback(update: Update, context: ContextTypes.DEFAUL
         return
 
     if data == "tt:week":
-        html = context.user_data.get("last_timetable_html")
-        cached_time = context.user_data.get("last_timetable_time", 0)
-        if not html or (time.time() - cached_time > 600):
-            try:
-                await query.edit_message_text("⏳ <i>Fetching full week timetable...</i>", parse_mode="HTML")
-                html = await workload_manager.submit_job(
-                    workload_manager.timetable_queue,
-                    uid,
-                    "fetch_week_timetable",
-                    "timetable",
-                    _fetch_live_timetable_job,
-                    uid,
-                )
-                context.user_data["last_timetable_html"] = html
-                context.user_data["last_timetable_time"] = time.time()
-            except Exception as exc:
-                await query.edit_message_text(f"⚠️ <i>Could not load week timetable: {html_lib.escape(str(exc))}</i>", parse_mode="HTML")
-                return
+        try:
+            await query.edit_message_text("⚡ <i>Fetching live week timetable from ERP...</i>", parse_mode="HTML")
+            html = await workload_manager.submit_coalesced_job(
+                (uid, "week_timetable"),
+                workload_manager.timetable_queue,
+                uid,
+                "fetch_week_timetable",
+                "timetable",
+                _fetch_live_timetable_job,
+                uid,
+            )
+            context.user_data["last_timetable_html"] = html
+            context.user_data["last_timetable_time"] = time.time()
+        except Exception as exc:
+            await query.edit_message_text(f"⚠️ <i>Could not load week timetable: {html_lib.escape(str(exc))}</i>", parse_mode="HTML")
+            return
 
         messages = get_timetable_messages(html)
         try:
@@ -1671,31 +1702,42 @@ async def handle_user_status_change(update: Update, context: ContextTypes.DEFAUL
 
 
 async def _start_health_server(app: Application) -> None:
-    """Start the FastAPI WebApp & Health server on PORT for Render/Cloud deployment."""
+    """Start a lightweight HTTP health responder if deployed on Render/Cloud (when PORT is set)."""
     import os
-    port = os.getenv("PORT") or str(getattr(config, "WEBAPP_PORT", 8000))
+    port = os.getenv("PORT")
+    if not port:
+        return
     try:
         port_num = int(port)
-        host = getattr(config, "WEBAPP_HOST", "0.0.0.0")
 
-        import uvicorn
-        from webapp.api import app as fastapi_app
+        async def handle_ping(reader, writer):
+            try:
+                # 3-second timeout prevents socket exhaustion
+                await asyncio.wait_for(reader.read(1024), timeout=3.0)
+                response = (
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: text/plain\r\n"
+                    b"Content-Length: 2\r\n"
+                    b"Connection: close\r\n"
+                    b"\r\n"
+                    b"OK"
+                )
+                writer.write(response)
+                await writer.drain()
+            except Exception:
+                pass
+            finally:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
 
-        uvi_config = uvicorn.Config(
-            app=fastapi_app,
-            host=host,
-            port=port_num,
-            log_level="warning",
-            access_log=False,
-        )
-        server = uvicorn.Server(config=uvi_config)
-
-        task = asyncio.create_task(server.serve())
-        app.bot_data["_fastapi_server"] = server
-        app.bot_data["_fastapi_task"] = task
-        logger.info("FastAPI WebApp & Health server active on %s:%s for Render/Cloud deployment", host, port_num)
+        server = await asyncio.start_server(handle_ping, "0.0.0.0", port_num)
+        app.bot_data["_health_server"] = server
+        logger.info("Health check server active on port %s for Render/Cloud deployment", port_num)
     except Exception as exc:
-        logger.warning("Could not start WebApp & Health server on port %s: %s", port, exc)
+        logger.warning("Could not start cloud health check server on port %s: %s", port, exc)
 
 
 async def _setup_bot_commands(app: Application) -> None:
@@ -1718,15 +1760,8 @@ async def _setup_bot_commands(app: Application) -> None:
         logger.warning("Could not register bot commands with Telegram: %s", exc)
 
     try:
-        from telegram import MenuButtonCommands, MenuButtonWebApp
-        if getattr(config, "MINI_APP_URL", "") and config.MINI_APP_URL.startswith("https://"):
-            await app.bot.set_chat_menu_button(
-                menu_button=MenuButtonWebApp(text="Dashboard", web_app=WebAppInfo(url=config.MINI_APP_URL))
-            )
-        else:
-            await app.bot.set_chat_menu_button(
-                menu_button=MenuButtonCommands()
-            )
+        from telegram import MenuButtonCommands
+        await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
         logger.info("Configured native Telegram Menu Button.")
     except Exception as exc:
         logger.warning("Could not set chat menu button: %s", exc)
@@ -1760,6 +1795,13 @@ async def _post_init(app: Application) -> None:
     await _setup_bot_commands(app)
     # Start the central WorkloadManager and its worker pools + TelegramOutbox
     await workload_manager.start(bot_instance=app.bot)
+    # Warmup MongoDB in-memory session/cache preloading
+    try:
+        loaded = storage.warmup_storage_caches()
+        logger.info("Storage caches preloaded into RAM (%d active sessions/preferences).", loaded)
+    except Exception as exc:
+        logger.warning("Could not pre-warm storage caches: %s", exc)
+
     # Pre-warm ONNX CAPTCHA solver to eliminate first-login cold-start latency
     try:
         from erp.captcha_solver import warmup_captcha_solver
@@ -1770,15 +1812,12 @@ async def _post_init(app: Application) -> None:
 
 
 async def _post_shutdown(app: Application) -> None:
-    """Graceful shutdown hook to cleanly stop WebApp server, WorkloadManager, and workers."""
-    server = app.bot_data.get("_fastapi_server")
+    """Graceful shutdown hook to cleanly stop health server, WorkloadManager, and workers."""
+    server = app.bot_data.get("_health_server")
     if server:
-        logger.info("Stopping FastAPI WebApp server...")
-        server.should_exit = True
-    task = app.bot_data.get("_fastapi_task")
-    if task and not task.done():
         try:
-            await asyncio.wait_for(task, timeout=3.0)
+            server.close()
+            await server.wait_closed()
         except Exception:
             pass
     logger.info("Bot is shutting down, stopping WorkloadManager...")
@@ -1851,6 +1890,22 @@ def main() -> None:
             interval=300,
             first=300,
             name="rate_limiter_cleanup",
+        )
+
+        # Schedule periodic ERP session warmer (refreshes active sessions before expiry)
+        async def _session_warmer_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+            try:
+                refreshed = await warm_active_sessions()
+                if refreshed > 0:
+                    logger.info("Session warmer refreshed %d ERP sessions", refreshed)
+            except Exception as exc:
+                logger.warning("Session warmer error: %s", exc)
+
+        application.job_queue.run_repeating(
+            _session_warmer_job,
+            interval=1200,
+            first=600,
+            name="erp_session_warmer",
         )
 
     logger.info("KL University Timetable Bot v%s is starting...", BOT_VERSION)

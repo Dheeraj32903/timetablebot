@@ -106,9 +106,3 @@ TELEGRAM_DELIVERY_MAX_RPS = float(os.getenv("TELEGRAM_DELIVERY_MAX_RPS", "20.0")
 # --- Cache & TTL ---
 MORNING_CACHE_TTL_SECONDS = int(os.getenv("MORNING_CACHE_TTL_SECONDS", "14400"))  # 4 hours
 
-# --- Telegram Mini App & Web Server ---
-MINI_APP_URL = os.getenv("MINI_APP_URL", "").strip()
-WEBAPP_HOST = os.getenv("WEBAPP_HOST", "0.0.0.0").strip()
-WEBAPP_PORT = int(os.getenv("PORT", "8000"))
-DEV_ALLOW_ANONYMOUS = os.getenv("DEV_ALLOW_ANONYMOUS", "true").lower() == "true"
-

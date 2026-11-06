@@ -178,7 +178,14 @@ async def outpass_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             sess = load_session(user_id=uid)
             if saved and sess and sess.get("cookies"):
                 try:
-                    outpasses = await outpass_api.fetch_outpass_history(user_id=uid)
+                    outpasses = await workload_manager.submit_job(
+                        workload_manager.outpass_queue,
+                        uid,
+                        "fetch_outpass_history",
+                        "outpass",
+                        outpass_api.fetch_outpass_history,
+                        user_id=uid,
+                    )
                 except Exception:
                     outpasses = []
 
@@ -298,7 +305,14 @@ async def handle_outpass_callback(update: Update, context: ContextTypes.DEFAULT_
                 sess = load_session(user_id=uid)
                 if saved and sess and sess.get("cookies"):
                     try:
-                        outpasses = await outpass_api.fetch_outpass_history(user_id=uid)
+                        outpasses = await workload_manager.submit_job(
+                            workload_manager.outpass_queue,
+                            uid,
+                            "fetch_outpass_history",
+                            "outpass",
+                            outpass_api.fetch_outpass_history,
+                            user_id=uid,
+                        )
                     except Exception:
                         outpasses = []
 
@@ -693,7 +707,14 @@ async def handle_outpass_callback(update: Update, context: ContextTypes.DEFAULT_
                 outpasses = []
                 if saved and sess and sess.get("cookies"):
                     try:
-                        outpasses = await outpass_api.fetch_outpass_history(user_id=uid)
+                        outpasses = await workload_manager.submit_job(
+                            workload_manager.outpass_queue,
+                            uid,
+                            "fetch_outpass_history",
+                            "outpass",
+                            outpass_api.fetch_outpass_history,
+                            user_id=uid,
+                        )
                     except Exception:
                         outpasses = []
                 if not outpasses:
@@ -781,7 +802,14 @@ async def handle_outpass_callback(update: Update, context: ContextTypes.DEFAULT_
                 outpasses = []
                 if saved and sess and sess.get("cookies"):
                     try:
-                        outpasses = await outpass_api.fetch_outpass_history(user_id=uid)
+                        outpasses = await workload_manager.submit_job(
+                            workload_manager.outpass_queue,
+                            uid,
+                            "fetch_outpass_history",
+                            "outpass",
+                            outpass_api.fetch_outpass_history,
+                            user_id=uid,
+                        )
                     except Exception:
                         outpasses = []
                 if not outpasses:

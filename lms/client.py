@@ -26,7 +26,7 @@ class LMSClient:
         if cls._shared_client is None or cls._shared_client.is_closed:
             cls._shared_client = httpx.AsyncClient(
                 timeout=timeout,
-                limits=httpx.Limits(max_keepalive_connections=30, max_connections=40),
+                limits=httpx.Limits(max_keepalive_connections=30, max_connections=40, keepalive_expiry=120.0),
                 headers={
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
                     "Accept": "application/json, text/html, */*",

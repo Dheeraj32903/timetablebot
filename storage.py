@@ -57,6 +57,57 @@ except Exception as exc:
     raise RuntimeError(f"MongoDB connection failed: {exc}")
 
 
+def warmup_storage_caches() -> int:
+    """Pre-warm memory caches from MongoDB at startup for zero DB latency on first user hit."""
+    count = 0
+    try:
+        for doc in _mongo_db.users.find({}, {"session": 1, "lms_token": 1, "morning_enabled": 1}):
+            uid = int(doc["_id"])
+            if "session" in doc and doc["session"]:
+                _session_cache[uid] = doc["session"]
+            if "lms_token" in doc and doc["lms_token"]:
+                _lms_token_cache[uid] = doc["lms_token"]
+            if "morning_enabled" in doc:
+                _morning_status_cache[uid] = bool(doc["morning_enabled"])
+            count += 1
+        logger.info("Pre-warmed in-memory caches for %d users from MongoDB.", count)
+    except Exception as exc:
+        logger.warning("Could not pre-warm storage caches from MongoDB: %s", exc)
+    return count
+
+
+_morning_alert_sent_today: dict[int, str] = {}
+
+
+def has_morning_alert_sent_today(user_id: int, date_str: str) -> bool:
+    """Check if morning alert was already sent to this user today (idempotency)."""
+    uid = int(user_id)
+    if _morning_alert_sent_today.get(uid) == date_str:
+        return True
+    try:
+        doc = _mongo_db.users.find_one({"_id": uid}, {"last_morning_alert_date": 1})
+        if doc and doc.get("last_morning_alert_date") == date_str:
+            _morning_alert_sent_today[uid] = date_str
+            return True
+    except Exception as exc:
+        logger.error("Error checking morning alert idempotency in MongoDB: %s", exc)
+    return False
+
+
+def record_morning_alert_sent(user_id: int, date_str: str) -> None:
+    """Record that morning alert was sent to this user today."""
+    uid = int(user_id)
+    _morning_alert_sent_today[uid] = date_str
+    try:
+        _mongo_db.users.update_one(
+            {"_id": uid},
+            {"$set": {"last_morning_alert_date": date_str}},
+            upsert=True,
+        )
+    except Exception as exc:
+        logger.error("Error saving morning alert date in MongoDB: %s", exc)
+
+
 def is_mongodb_active() -> bool:
     """Always returns True since MongoDB is required and verified on startup."""
     return True

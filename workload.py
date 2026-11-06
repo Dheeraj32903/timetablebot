@@ -45,21 +45,25 @@ class JobMetrics:
     gate_wait_ms: float = 0.0
     captcha_ms: float = 0.0
     login_ms: float = 0.0
+    request_latency_ms: float = 0.0
     erp_latency_ms: float = 0.0
     parse_ms: float = 0.0
     total_duration_ms: float = 0.0
     retries: int = 0
+    is_warm: bool = True
     success: bool = False
     error: Optional[str] = None
 
     def log_summary(self):
+        mode_str = "Warm Session (1-hop)" if self.is_warm else "Cold Re-Login (CAPTCHA + Login)"
         logger.info(
-            "JOB_DONE | id=%s | op=%s | uid=%s | queue=%s | wait=%.1fms | lock=%.1fms | "
+            "JOB_DONE | id=%s | op=%s | uid=%s | queue=%s | mode=[%s] | wait=%.1fms | lock=%.1fms | "
             "gate=%.1fms | erp=%.1fms | total=%.1fms | success=%s | retries=%d%s",
             self.job_id,
             self.operation,
             self.user_id,
             self.queue_name,
+            mode_str,
             self.queue_wait_ms,
             self.lock_wait_ms,
             self.gate_wait_ms,
@@ -112,28 +116,46 @@ class LeakyBucketRateLimiter:
         await asyncio.sleep(wait_time)
 
 
-class GlobalERPGate:
+class PriorityERPGate:
     """
-    Unified gate placed underneath all ERP worker pools:
-    1. Bounded concurrency semaphore (max in-flight requests)
-    2. Rate limiter (max requests per second)
+    Priority Semaphore and Rate Limiter for the ERP backend.
+    Priority 0: Outpass (critical hostel passes)
+    Priority 1: Interactive Timetable (on-demand student commands)
+    Priority 2: LMS
+    Priority 3: Prefetch (background batch warmup)
+
+    Ensures Priority 0 and 1 requests always jump ahead of Priority 3 prefetch requests
+    when all concurrency slots are saturated.
     """
     def __init__(self, max_concurrency: int = 5, max_rps: float = 5.0):
         self.max_concurrency = max_concurrency
         self.max_rps = max_rps
-        self._semaphore = asyncio.Semaphore(max_concurrency)
+        self._available_slots = max_concurrency
         self._rate_limiter = LeakyBucketRateLimiter(rate=max_rps, burst_capacity=1)
+        self._waiters: List[Tuple[int, float, asyncio.Future]] = []
+        self._lock = asyncio.Lock()
         self.current_in_flight = 0
         self.max_observed_in_flight = 0
-        self._lock = asyncio.Lock()
 
-    async def acquire(self) -> float:
+    async def acquire(self, priority: int = 1) -> float:
         t0 = time.perf_counter()
-        await self._semaphore.acquire()
+        fut = None
+        async with self._lock:
+            if self._available_slots > 0:
+                self._available_slots -= 1
+            else:
+                loop = asyncio.get_running_loop()
+                fut = loop.create_future()
+                self._waiters.append((priority, time.monotonic(), fut))
+                self._waiters.sort(key=lambda x: (x[0], x[1]))
+
+        if fut is not None:
+            await fut
+
         try:
             await self._rate_limiter.acquire()
         except BaseException:
-            self._semaphore.release()
+            await self.release()
             raise
 
         gate_wait_ms = (time.perf_counter() - t0) * 1000.0
@@ -142,18 +164,40 @@ class GlobalERPGate:
             self.current_in_flight += 1
             if self.current_in_flight > self.max_observed_in_flight:
                 self.max_observed_in_flight = self.current_in_flight
+
         return gate_wait_ms
 
     async def release(self):
         async with self._lock:
-            self.current_in_flight -= 1
-        self._semaphore.release()
+            self.current_in_flight = max(0, self.current_in_flight - 1)
+            while self._waiters:
+                _, _, next_fut = self._waiters.pop(0)
+                if not next_fut.done():
+                    next_fut.set_result(None)
+                    return
+            self._available_slots += 1
+
+    def priority_slot(self, priority: int = 1):
+        """Context manager for acquiring a slot with explicit priority."""
+        gate = self
+        class _SlotContext:
+            def __init__(self):
+                self.wait_ms = 0.0
+            async def __aenter__(self):
+                self.wait_ms = await gate.acquire(priority=priority)
+                return self.wait_ms
+            async def __aexit__(self, exc_type, exc_val, exc_tb):
+                await gate.release()
+        return _SlotContext()
 
     async def __aenter__(self) -> float:
-        return await self.acquire()
+        return await self.acquire(priority=1)
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.release()
+
+
+GlobalERPGate = PriorityERPGate
 
 
 class GlobalLMSGate:
@@ -192,26 +236,33 @@ class GlobalLMSGate:
 # ---------------------------------------------------------------------------
 
 class UserLockRegistry:
-    """Thread-safe and async-safe per-user lock registry."""
+    """Thread-safe and memory-safe per-user lock registry with auto-pruning."""
     def __init__(self):
         self._locks: Dict[int, asyncio.Lock] = {}
+        self._last_accessed: Dict[int, float] = {}
         self._registry_lock = asyncio.Lock()
 
     async def get_lock(self, user_id: int) -> asyncio.Lock:
         uid = int(user_id)
         async with self._registry_lock:
-            # Auto-prune unheld locks when registry grows large
-            if len(self._locks) > 200:
-                self._prune_unlocked_internal()
+            now = time.monotonic()
+            self._last_accessed[uid] = now
+            if len(self._locks) > 100:
+                self._prune_unlocked_internal(now)
             if uid not in self._locks:
                 self._locks[uid] = asyncio.Lock()
             return self._locks[uid]
 
-    def _prune_unlocked_internal(self) -> None:
-        """Internal prune called while _registry_lock is held."""
-        to_del = [uid for uid, lock in self._locks.items() if not lock.locked()]
+    def _prune_unlocked_internal(self, now: Optional[float] = None) -> None:
+        """Internal prune for locks that are unlocked and idle."""
+        cur = now if now is not None else time.monotonic()
+        to_del = [
+            uid for uid, lock in self._locks.items()
+            if not lock.locked() and (cur - self._last_accessed.get(uid, 0) > 900.0)
+        ]
         for uid in to_del:
             self._locks.pop(uid, None)
+            self._last_accessed.pop(uid, None)
 
     async def cleanup_idle_locks(self) -> None:
         """Periodic background sweep for idle unlocked user locks."""
@@ -376,6 +427,8 @@ class WorkloadManager:
         self._running = False
         self._workers: List[asyncio.Task] = []
         self._job_counter = 0
+        self._in_flight_requests: Dict[Tuple[int, str], asyncio.Future] = {}
+        self._in_flight_lock = asyncio.Lock()
 
     def _next_job_id(self, prefix: str) -> str:
         self._job_counter += 1
@@ -456,6 +509,19 @@ class WorkloadManager:
                                     call_kwargs["user_id"] = user_id
                         elif "user_id" in call_kwargs and not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
                             call_kwargs.pop("user_id", None)
+
+                        queue_priority = 1
+                        if queue is self.outpass_queue:
+                            queue_priority = 0
+                        elif queue is self.timetable_queue:
+                            queue_priority = 1
+                        elif queue is self.lms_queue:
+                            queue_priority = 2
+                        elif queue is self.prefetch_queue:
+                            queue_priority = 3
+
+                        if "priority" in sig.parameters and "priority" not in call_kwargs:
+                            call_kwargs["priority"] = queue_priority
 
                         res = await job.handler(*job.args, **call_kwargs)
                         m.success = True
@@ -558,6 +624,47 @@ class WorkloadManager:
             raise RuntimeError(f"Server is busy: {queue_name} queue is full. Please try again in a moment.")
 
         return await fut
+
+    async def submit_coalesced_job(
+        self,
+        command_key: Tuple[int, str],
+        queue: asyncio.Queue,
+        user_id: int,
+        operation: str,
+        queue_name: str,
+        handler: Callable[..., Coroutine[Any, Any, Any]],
+        *args,
+        **kwargs,
+    ) -> Any:
+        """
+        Coalesce identical in-flight real-time requests for the same user and command.
+        If a user clicks /timetable multiple times while one is already in flight,
+        both requests attach to the same Future and receive the real-time result
+        without double-hitting the ERP.
+        """
+        async with self._in_flight_lock:
+            if command_key in self._in_flight_requests:
+                existing_fut = self._in_flight_requests[command_key]
+                if not existing_fut.done():
+                    logger.info("COALESCE_HIT | key=%s - joined in-flight request", command_key)
+                    return await existing_fut
+
+            loop = asyncio.get_running_loop()
+            fut = loop.create_future()
+            self._in_flight_requests[command_key] = fut
+
+        try:
+            result = await self.submit_job(queue, user_id, operation, queue_name, handler, *args, **kwargs)
+            if not fut.done():
+                fut.set_result(result)
+            return result
+        except Exception as exc:
+            if not fut.done():
+                fut.set_exception(exc)
+            raise
+        finally:
+            async with self._in_flight_lock:
+                self._in_flight_requests.pop(command_key, None)
 
 
 # Global singleton instance

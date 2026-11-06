@@ -112,24 +112,14 @@ async def perform_login(
 
 
 
-async def fetch_timetable_html(
-    user_id: Optional[int] = None,
-    cookies: Optional[dict] = None,
+async def _do_fetch_timetable(
+    cookies: dict,
     csrf_token: Optional[str] = None,
+    user_id: Optional[int] = None,
+    priority: int = 1,
+    metric: Optional[object] = None,
 ) -> str:
-    """
-    Fetch the latest timetable HTML using the user's stored session.
-    Raises an exception if the session is missing or expired.
-    """
-    if cookies is None:
-        session = load_session(user_id=user_id)
-        if not session or not session.get("cookies"):
-            raise RuntimeError("No active ERP session. Please run /login first.")
-        cookies = session.get("cookies", {})
-        csrf_token = session.get("csrf_token", "")
-
-    # Extract academic year and semester from config or the configured timetable URL.
-    # Defaults are 29 and 1 if parsing fails.
+    """Internal helper to execute the timetable HTTP request."""
     academic_year_code = config.ERP_ACADEMIC_YEAR or "29"
     semester_id = config.ERP_SEMESTER_ID or "1"
     url = config.ERP_TIMETABLE_URL
@@ -148,6 +138,8 @@ async def fetch_timetable_html(
         academic_year_code,
         semester_id,
         user_id=user_id,
+        priority=priority,
+        metric=metric,
     )
 
     if not html.strip():
@@ -155,7 +147,122 @@ async def fetch_timetable_html(
 
     lower_html = html.lower()
     if "loginform" in lower_html or 'name="login-form"' in lower_html or "captcha" in lower_html:
-        raise RuntimeError("ERP returned the login page. Session expired. Please run /login again.")
+        raise RuntimeError("ERP returned the login page. Session expired.")
 
     return html
+
+
+async def fetch_timetable_html(
+    user_id: Optional[int] = None,
+    cookies: Optional[dict] = None,
+    csrf_token: Optional[str] = None,
+    priority: int = 1,
+    auto_relogin: bool = True,
+    metric: Optional[object] = None,
+) -> str:
+    """
+    Fetch the latest live timetable HTML from ERP using warm session pooling.
+    Guarantees 100% real-time data directly from ERP.
+    If session is missing or expired, transparently auto re-logs in and retries once.
+    """
+    # 1. If explicit cookies provided (e.g. friend lookup)
+    if cookies is not None:
+        return await _do_fetch_timetable(
+            cookies, csrf_token, user_id=user_id, priority=priority, metric=metric
+        )
+
+    if user_id is None:
+        raise ValueError("user_id or cookies must be provided to fetch_timetable_html")
+
+    uid = int(user_id)
+
+    # 2. Fast Path: Attempt 1-hop fetch with active in-memory / MongoDB session
+    session = load_session(user_id=uid)
+    if session and session.get("cookies"):
+        try:
+            html = await _do_fetch_timetable(
+                session["cookies"],
+                session.get("csrf_token", ""),
+                user_id=uid,
+                priority=priority,
+                metric=metric,
+            )
+            if metric and hasattr(metric, "is_warm"):
+                metric.is_warm = True
+            return html
+        except Exception as exc:
+            logger.info("Direct session fetch failed for user %s: %s. Attempting transparent re-login...", uid, exc)
+
+    # 3. Session missing or expired -> Auto re-login if enabled
+    if not auto_relogin:
+        raise RuntimeError("No active ERP session. Please log in using /login first.")
+
+    import credentials
+    creds = credentials.load_user_credentials(uid)
+    if not creds or not creds.get("username") or not creds.get("password"):
+        raise RuntimeError("No active ERP session or saved credentials. Please run /login first.")
+
+    t_login = time.perf_counter()
+    login_res = await perform_login(creds["username"], creds["password"], user_id=uid)
+    if metric:
+        if hasattr(metric, "is_warm"):
+            metric.is_warm = False
+        if hasattr(metric, "login_ms"):
+            metric.login_ms = (time.perf_counter() - t_login) * 1000.0
+
+    new_cookies = login_res["cookies"]
+    new_csrf = login_res.get("csrf_token", "")
+
+    # 4. Retry timetable fetch with newly refreshed session
+    return await _do_fetch_timetable(
+        new_cookies,
+        new_csrf,
+        user_id=uid,
+        priority=priority,
+        metric=metric,
+    )
+
+
+async def warm_active_sessions() -> int:
+    """
+    Background session-warmer task:
+    Keeps authenticated sessions warm in RAM for active users with stored credentials,
+    preventing cold-start latency when users execute interactive commands.
+    """
+    import credentials
+    from datetime import datetime, timezone
+
+    morning_users = storage.get_all_morning_users()
+    warmed_count = 0
+    now = time.time()
+
+    for uid in morning_users:
+        try:
+            sess = load_session(user_id=uid)
+            creds = credentials.load_user_credentials(uid)
+            if not creds or not creds.get("username") or not creds.get("password"):
+                continue
+
+            needs_warm = False
+            if not sess or not sess.get("cookies"):
+                needs_warm = True
+            else:
+                updated_at_str = sess.get("updated_at")
+                if updated_at_str:
+                    try:
+                        dt = datetime.fromisoformat(updated_at_str)
+                        if (now - dt.timestamp()) > 1500:  # Older than 25 minutes
+                            needs_warm = True
+                    except Exception:
+                        needs_warm = True
+
+            if needs_warm:
+                logger.info("Session-warmer refreshing session for user %s", uid)
+                await perform_login(creds["username"], creds["password"], user_id=uid, max_retries=2)
+                warmed_count += 1
+        except Exception as exc:
+            logger.debug("Session warmer exception for user %s: %s", uid, exc)
+
+    return warmed_count
+
 
