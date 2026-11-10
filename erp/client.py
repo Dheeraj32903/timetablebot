@@ -4,7 +4,7 @@ import re
 import time
 import urllib3
 import warnings
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 import httpx
@@ -273,8 +273,8 @@ async def auto_login(username: str, password: str, user_id: Optional[int] = None
 async def fetch_timetable(
     cookies: dict,
     csrf_token: str,
-    academic_year_code: str = "29",
-    semester_id: str = "1",
+    academic_year_code: str = "19",
+    semester_id: str = "2",
     user_id: Optional[int] = None,
     priority: int = 1,
     metric: Optional[Any] = None,
