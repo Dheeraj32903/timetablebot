@@ -228,6 +228,173 @@ backend_throttle = BackendThrottle()
 brute_force_tracker = BruteForceTracker()
 
 
+# --- HTTP Health Endpoint Protection Constants ---
+HEALTH_MAX_CONCURRENT_CONNS = 25
+HEALTH_IP_WINDOW_SECONDS = 10.0
+HEALTH_IP_MAX_REQUESTS = 30
+HEALTH_ALLOWED_METHODS = {"GET", "HEAD"}
+HEALTH_ALLOWED_PATHS = {"/", "/health", "/healthz", "/ping", "/robots.txt"}
+
+
+class HttpHealthGuard:
+    """
+    Hardened HTTP responder for cloud health check sockets (Render/Kubernetes).
+    Defends against:
+    - Slowloris (slow read/write attacks) via strict 2.5s timeouts
+    - Socket/FD exhaustion via active connection semaphore
+    - HTTP DoS/flooding via per-IP sliding window rate limiting
+    - Method tampering (restricts to GET/HEAD)
+    - Vulnerability scanners/path traversal (restricts paths to health checks)
+    - Information leakage (applies security headers & masks server identity)
+    """
+
+    def __init__(self, max_concurrent: int = HEALTH_MAX_CONCURRENT_CONNS):
+        self._semaphore = asyncio.Semaphore(max_concurrent)
+        self._ip_timestamps: dict[str, deque[float]] = defaultdict(deque)
+
+    def _is_ip_rate_limited(self, ip: str, now: float) -> bool:
+        q = self._ip_timestamps[ip]
+        cutoff = now - HEALTH_IP_WINDOW_SECONDS
+        while q and q[0] < cutoff:
+            q.popleft()
+        if len(q) >= HEALTH_IP_MAX_REQUESTS:
+            return True
+        q.append(now)
+        return False
+
+    def cleanup_inactive_ips(self) -> None:
+        now = time.time()
+        cutoff = now - HEALTH_IP_WINDOW_SECONDS
+        for ip in list(self._ip_timestamps.keys()):
+            q = self._ip_timestamps[ip]
+            while q and q[0] < cutoff:
+                q.popleft()
+            if not q:
+                self._ip_timestamps.pop(ip, None)
+
+    async def handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        # 1. Connection Concurrency Protection
+        if self._semaphore.locked():
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+            return
+
+        async with self._semaphore:
+            peer = writer.get_extra_info("peername")
+            client_ip = peer[0] if (peer and len(peer) > 0) else "unknown"
+            now = time.time()
+
+            # 2. Rate Limiting Protection per IP
+            if client_ip != "unknown" and self._is_ip_rate_limited(client_ip, now):
+                response = (
+                    b"HTTP/1.1 429 Too Many Requests\r\n"
+                    b"Content-Type: text/plain; charset=utf-8\r\n"
+                    b"Server: bot-guard\r\n"
+                    b"Retry-After: 5\r\n"
+                    b"Connection: close\r\n"
+                    b"Content-Length: 17\r\n"
+                    b"\r\n"
+                    b"Too Many Requests"
+                )
+                try:
+                    writer.write(response)
+                    await asyncio.wait_for(writer.drain(), timeout=1.5)
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+                return
+
+            try:
+                # 3. Slowloris Protection: strict 2.5s read timeout & 1KB read boundary
+                raw_data = await asyncio.wait_for(reader.read(1024), timeout=2.5)
+                if not raw_data:
+                    return
+
+                # 4. HTTP Request Line Parsing & Whitelist Validation
+                first_line = raw_data.split(b"\r\n", 1)[0].decode("latin-1", errors="replace").strip()
+                parts = first_line.split()
+
+                if len(parts) < 2:
+                    status_code = b"400 Bad Request"
+                    body = b"Bad Request"
+                else:
+                    method, path = parts[0].upper(), parts[1].split("?")[0]
+                    if method not in HEALTH_ALLOWED_METHODS:
+                        status_code = b"405 Method Not Allowed"
+                        body = b"Method Not Allowed"
+                    elif path == "/robots.txt":
+                        status_code = b"200 OK"
+                        body = b"User-agent: *\nDisallow: /\n"
+                    elif path in HEALTH_ALLOWED_PATHS:
+                        status_code = b"200 OK"
+                        body = b"OK"
+                    else:
+                        # Scanners probing /admin, /.env, /wp-admin, etc. get 404
+                        status_code = b"404 Not Found"
+                        body = b"Not Found"
+
+                # 5. Security Headers Assembly
+                headers = (
+                    b"HTTP/1.1 " + status_code + b"\r\n"
+                    b"Content-Type: text/plain; charset=utf-8\r\n"
+                    b"Server: bot-guard\r\n"
+                    b"X-Content-Type-Options: nosniff\r\n"
+                    b"X-Frame-Options: DENY\r\n"
+                    b"Cache-Control: no-store, no-cache, must-revalidate\r\n"
+                    b"Content-Security-Policy: default-src 'none'\r\n"
+                    b"Connection: close\r\n"
+                    b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n"
+                    b"\r\n"
+                )
+
+                if len(parts) >= 1 and parts[0].upper() == "HEAD":
+                    writer.write(headers)
+                else:
+                    writer.write(headers + body)
+
+                # 6. Slow-write timeout protection
+                await asyncio.wait_for(writer.drain(), timeout=2.0)
+
+            except Exception:
+                pass
+            finally:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+
+
+http_health_guard = HttpHealthGuard()
+
+
+def sanitize_user_error(exc: Exception, default_message: str = "An unexpected error occurred. Please try again later.") -> str:
+    """
+    Sanitize exception strings before sending to chat to prevent information disclosure.
+    Prevents leakage of database URIs, passwords, IP addresses, tokens, or traceback fragments.
+    """
+    raw_str = str(exc)
+    sensitive_keywords = [
+        "mongodb", "password", "token", "secret", "fernet", "key",
+        "auth", "cookie", "traceback", "exception", "line ", "file ",
+        "syntax", "object at 0x", "credentials", "1e9m", "render"
+    ]
+    raw_lower = raw_str.lower()
+    if any(k in raw_lower for k in sensitive_keywords):
+        return default_message
+    if len(raw_str) > 120:
+        return default_message
+    return raw_str
+
+
 def validate_input_length(text: Optional[str], max_length: int = MAX_INPUT_LENGTH) -> bool:
     """Verify input string does not exceed safe buffer thresholds."""
     if not text:

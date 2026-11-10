@@ -330,7 +330,7 @@ async def _run_friend_login(update: Update, username: str, password: str) -> Non
         logger.warning("Friend login or fetch failed: %s", exc)
         await msg.edit_text(
             f"❌ <b>Could not fetch friend's timetable.</b>\n"
-            f"<i>{html_lib.escape(str(exc))}</i>\n\n"
+            f"<i>{html_lib.escape(security.sanitize_user_error(exc, 'Invalid credentials or ERP temporarily unavailable.'))}</i>\n\n"
             "Please check the username and password and try again.",
             parse_mode="HTML",
         )
@@ -595,7 +595,7 @@ async def _send_lms_pending_tasks(
         logger.exception("Error fetching pending tasks for user %s: %s", user_id, exc)
         err_msg = (
             "⚠️ <b>Could not fetch LMS tasks.</b>\n"
-            f"<i>{html_lib.escape(str(exc))}</i>\n\n"
+            f"<i>{html_lib.escape(security.sanitize_user_error(exc, 'Could not connect to LMS service.'))}</i>\n\n"
             "If your LMS password changed, please run /lms_login to reconnect."
         )
         if message_to_edit:
@@ -1342,7 +1342,7 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             kb = get_timetable_keyboard(target_day)
             await query.edit_message_text(messages[0] if messages else "⚠️ <i>Empty schedule</i>", parse_mode="HTML", reply_markup=kb)
         except Exception as exc:
-            await query.edit_message_text(f"⚠️ <i>Could not load timetable: {html_lib.escape(str(exc))}</i>", parse_mode="HTML")
+            await query.edit_message_text(f"⚠️ <i>{html_lib.escape(security.sanitize_user_error(exc, 'Could not load timetable from ERP.'))}</i>", parse_mode="HTML")
         return
 
     if data == "menu:week":
@@ -1364,7 +1364,7 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             for extra in messages[1:]:
                 await context.bot.send_message(chat_id=uid, text=extra, parse_mode="HTML")
         except Exception as exc:
-            await query.edit_message_text(f"⚠️ <i>Could not load week timetable: {html_lib.escape(str(exc))}</i>", parse_mode="HTML")
+            await query.edit_message_text(f"⚠️ <i>{html_lib.escape(security.sanitize_user_error(exc, 'Could not load week timetable from ERP.'))}</i>", parse_mode="HTML")
         return
 
     if data == "menu:submissions":
@@ -1493,7 +1493,7 @@ async def handle_timetable_callback(update: Update, context: ContextTypes.DEFAUL
                 context.user_data["last_timetable_html"] = html
                 context.user_data["last_timetable_time"] = time.time()
             except Exception as exc:
-                await query.edit_message_text(f"⚠️ <i>Could not load timetable: {html_lib.escape(str(exc))}</i>", parse_mode="HTML")
+                await query.edit_message_text(f"⚠️ <i>{html_lib.escape(security.sanitize_user_error(exc, 'Could not load timetable from ERP.'))}</i>", parse_mode="HTML")
                 return
 
         messages = get_timetable_messages(html, day_filter=target_day)
@@ -1523,7 +1523,7 @@ async def handle_timetable_callback(update: Update, context: ContextTypes.DEFAUL
             kb = get_timetable_keyboard(target_day)
             await query.edit_message_text(messages[0] if messages else "🏖️ <i>No classes found for this day.</i>", parse_mode="HTML", reply_markup=kb)
         except Exception as exc:
-            await query.edit_message_text(f"⚠️ <i>Failed to refresh timetable: {html_lib.escape(str(exc))}</i>", parse_mode="HTML")
+            await query.edit_message_text(f"⚠️ <i>{html_lib.escape(security.sanitize_user_error(exc, 'Failed to refresh timetable from ERP.'))}</i>", parse_mode="HTML")
         return
 
     if data == "tt:week":
@@ -1541,7 +1541,7 @@ async def handle_timetable_callback(update: Update, context: ContextTypes.DEFAUL
             context.user_data["last_timetable_html"] = html
             context.user_data["last_timetable_time"] = time.time()
         except Exception as exc:
-            await query.edit_message_text(f"⚠️ <i>Could not load week timetable: {html_lib.escape(str(exc))}</i>", parse_mode="HTML")
+            await query.edit_message_text(f"⚠️ <i>{html_lib.escape(security.sanitize_user_error(exc, 'Could not load week timetable from ERP.'))}</i>", parse_mode="HTML")
             return
 
         messages = get_timetable_messages(html)
@@ -1702,40 +1702,16 @@ async def handle_user_status_change(update: Update, context: ContextTypes.DEFAUL
 
 
 async def _start_health_server(app: Application) -> None:
-    """Start a lightweight HTTP health responder if deployed on Render/Cloud (when PORT is set)."""
+    """Start a hardened HTTP health responder if deployed on Render/Cloud (when PORT is set)."""
     import os
     port = os.getenv("PORT")
     if not port:
         return
     try:
         port_num = int(port)
-
-        async def handle_ping(reader, writer):
-            try:
-                # 3-second timeout prevents socket exhaustion
-                await asyncio.wait_for(reader.read(1024), timeout=3.0)
-                response = (
-                    b"HTTP/1.1 200 OK\r\n"
-                    b"Content-Type: text/plain\r\n"
-                    b"Content-Length: 2\r\n"
-                    b"Connection: close\r\n"
-                    b"\r\n"
-                    b"OK"
-                )
-                writer.write(response)
-                await writer.drain()
-            except Exception:
-                pass
-            finally:
-                try:
-                    writer.close()
-                    await writer.wait_closed()
-                except Exception:
-                    pass
-
-        server = await asyncio.start_server(handle_ping, "0.0.0.0", port_num)
+        server = await asyncio.start_server(security.http_health_guard.handle_connection, "0.0.0.0", port_num)
         app.bot_data["_health_server"] = server
-        logger.info("Health check server active on port %s for Render/Cloud deployment", port_num)
+        logger.info("Hardened health check server active on port %s for Render/Cloud deployment", port_num)
     except Exception as exc:
         logger.warning("Could not start cloud health check server on port %s: %s", port, exc)
 
@@ -1882,6 +1858,7 @@ def main() -> None:
     # Schedule memory cleanup for rate limiter inactive users and idle locks every 5 minutes.
     async def _cleanup_rate_limiter_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         security.rate_limiter.cleanup_inactive_users()
+        security.http_health_guard.cleanup_inactive_ips()
         await workload_manager.user_locks.cleanup_idle_locks()
 
     if application.job_queue:
