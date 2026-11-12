@@ -273,8 +273,8 @@ async def auto_login(username: str, password: str, user_id: Optional[int] = None
 async def fetch_timetable(
     cookies: dict,
     csrf_token: str,
-    academic_year_code: str = "19",
-    semester_id: str = "2",
+    academic_year_code: str = "",
+    semester_id: str = "",
     user_id: Optional[int] = None,
     priority: int = 1,
     metric: Optional[Any] = None,
@@ -299,11 +299,11 @@ async def fetch_timetable(
     if req_cookies:
         headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in req_cookies.items())
 
-    tt_url = (
-        f"{BASE_URL}/index.php?r=timetables%2Funiversitymasteracademictimetableview%2Findividualstudenttimetableget"
-        f"&UniversityMasterAcademicTimetableView%5Bacademicyear%5D={academic_year_code}"
-        f"&UniversityMasterAcademicTimetableView%5Bsemesterid%5D={semester_id}"
-    )
+    tt_url = f"{BASE_URL}/index.php?r=timetables%2Funiversitymasteracademictimetableview%2Findividualstudenttimetableget"
+    if academic_year_code:
+        tt_url += f"&UniversityMasterAcademicTimetableView%5Bacademicyear%5D={academic_year_code}"
+    if semester_id:
+        tt_url += f"&UniversityMasterAcademicTimetableView%5Bsemesterid%5D={semester_id}"
 
     client = get_shared_erp_client(timeout=35.0)
 

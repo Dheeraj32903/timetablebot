@@ -570,7 +570,12 @@ def get_timetable_messages(html: str, day_filter: Optional[str] = None, max_leng
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"🏖️ <i>No classes scheduled! Free day.</i>"
             )]
-        return ["⚠️ <i>Could not extract timetable schedule from ERP response.</i>"]
+        return [(
+            "📅 <b>ACADEMIC SCHEDULE</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🏖️ <i>No classes scheduled yet.</i>\n\n"
+            "<i>(Once course registration is complete in ERP, your schedule will appear here automatically.)</i>"
+        )]
 
     messages: List[str] = []
     current_chunk: List[str] = []

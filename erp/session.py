@@ -121,8 +121,8 @@ async def _do_fetch_timetable(
     metric: Optional[object] = None,
 ) -> str:
     """Internal helper to execute the timetable HTTP request."""
-    academic_year_code = config.ERP_ACADEMIC_YEAR or "19"
-    semester_id = config.ERP_SEMESTER_ID or "2"
+    academic_year_code = config.ERP_ACADEMIC_YEAR or ""
+    semester_id = config.ERP_SEMESTER_ID or ""
     url = config.ERP_TIMETABLE_URL
     if not config.ERP_ACADEMIC_YEAR and "academicyear%5D=" in url:
         match = re.search(r"academicyear%5D=(\d+)", url)

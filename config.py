@@ -48,15 +48,15 @@ ERP_LOGIN_URL = os.getenv(
 )
 ERP_TIMETABLE_URL = os.getenv(
     "ERP_TIMETABLE_URL",
-    "https://newerp.kluniversity.in/index.php?r=timetables%2Funiversitymasteracademictimetableview%2Findividualstudenttimetableget&UniversityMasterAcademicTimetableView%5Bacademicyear%5D=19&UniversityMasterAcademicTimetableView%5Bsemesterid%5D=2",
+    "https://newerp.kluniversity.in/index.php?r=timetables%2Funiversitymasteracademictimetableview%2Findividualstudenttimetableget",
 )
 ERP_TIMETABLE_REFERER_URL = os.getenv(
     "ERP_TIMETABLE_REFERER_URL",
     "https://newerp.kluniversity.in/index.php?r=timetables%2Funiversitymasteracademictimetableview%2Findexstudentindisearch",
 )
 
-ERP_ACADEMIC_YEAR = os.getenv("ERP_ACADEMIC_YEAR", "19").strip()
-ERP_SEMESTER_ID = os.getenv("ERP_SEMESTER_ID", "2").strip()
+ERP_ACADEMIC_YEAR = os.getenv("ERP_ACADEMIC_YEAR", "").strip()
+ERP_SEMESTER_ID = os.getenv("ERP_SEMESTER_ID", "").strip()
 
 ERP_USER_AGENT = os.getenv(
     "ERP_USER_AGENT",
